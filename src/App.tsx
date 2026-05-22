@@ -19,8 +19,24 @@ import {
   Search,
   Calendar,
   Filter,
-  Trash2
+  Trash2,
+  Sun,
+  Moon
 } from "lucide-react";
+
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  Cell,
+  PieChart,
+  Pie,
+  Legend
+} from "recharts";
 
 // Types for processed metrics and tabular structures
 export const computeAgeText = (ms: number, formatMode: "days-hours" | "total-hours" = "days-hours"): string => {
@@ -57,6 +73,28 @@ interface RunStats {
 }
 
 export default function App() {
+  // Theme state with localStorage persistence
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    try {
+      const saved = localStorage.getItem("escalation_theme");
+      return (saved === "light" || saved === "dark") ? saved : "dark";
+    } catch {
+      return "dark";
+    }
+  });
+
+  const activeTheme = theme || "dark";
+
+  const toggleTheme = () => {
+    const next = activeTheme === "dark" ? "light" : "dark";
+    setTheme(next);
+    try {
+      localStorage.setItem("escalation_theme", next);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   // Navigation & Step Wizard: "import" -> "column_mapping" -> "processing" -> "dashboard"
   const [step, setStep] = useState<"import" | "column_mapping" | "processing" | "dashboard">("import");
   
@@ -102,6 +140,13 @@ export default function App() {
   const [selectedCategoryFilters, setSelectedCategoryFilters] = useState<Record<string, string>>({});
   const [sortColumn, setSortColumn] = useState<string | null>(null);
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
+  
+  // Collapsible dropdown filter panel states
+  const [isFilterOpen, setIsFilterOpen] = useState<boolean>(false);
+  const [dateStartFilter, setDateStartFilter] = useState<string>("");
+  const [dateEndFilter, setDateEndFilter] = useState<string>("");
+  const [minAgeHours, setMinAgeHours] = useState<string>("");
+  const [maxAgeHours, setMaxAgeHours] = useState<string>("");
 
   // Helper parser: Splits raw CSV rows while safely disregarding commas enveloped inside tags
   const parseCSVLine = (line: string): string[] => {
@@ -568,9 +613,14 @@ export default function App() {
     return categories;
   }, [stats, headers, selectedTimestampCol]);
 
-  // Clear all categorical filters helper
+  // Clear all filters helper
   const clearCategoryFilters = () => {
     setSelectedCategoryFilters({});
+    setDateStartFilter("");
+    setDateEndFilter("");
+    setMinAgeHours("");
+    setMaxAgeHours("");
+    setSearchQuery("");
     setCurrentPage(1);
   };
 
@@ -597,8 +647,37 @@ export default function App() {
         r.rawData.some(cell => String(cell).toLowerCase().includes(q))
       );
     }
+
+    // Apply date range filter
+    if (dateStartFilter) {
+      const startMs = new Date(dateStartFilter).getTime();
+      if (!isNaN(startMs)) {
+        rows = rows.filter(r => new Date(r.timestamp).getTime() >= startMs);
+      }
+    }
+    if (dateEndFilter) {
+      const endMs = new Date(dateEndFilter).getTime() + 24 * 60 * 60 * 1000 - 1; // inclusive end of day
+      if (!isNaN(endMs)) {
+        rows = rows.filter(r => new Date(r.timestamp).getTime() <= endMs);
+      }
+    }
+
+    // Apply age range filter (hours)
+    if (minAgeHours.trim() !== "") {
+      const minMs = parseFloat(minAgeHours) * 60 * 60 * 1000;
+      if (!isNaN(minMs)) {
+        rows = rows.filter(r => r.ageMs >= minMs);
+      }
+    }
+    if (maxAgeHours.trim() !== "") {
+      const maxMs = parseFloat(maxAgeHours) * 60 * 60 * 1000;
+      if (!isNaN(maxMs)) {
+        rows = rows.filter(r => r.ageMs <= maxMs);
+      }
+    }
+
     return rows;
-  }, [stats, selectedCategoryFilters, searchQuery, headers]);
+  }, [stats, selectedCategoryFilters, searchQuery, headers, dateStartFilter, dateEndFilter, minAgeHours, maxAgeHours]);
 
   // Sort and filter dataset viewer rows elements
   const sortedAndFilteredRows = useMemo(() => {
@@ -698,6 +777,192 @@ export default function App() {
 
   const totalPages = Math.ceil(sortedAndFilteredRows.length / pageSize) || 1;
 
+  // Dynamically detected columns for simplified table and metrics mapping
+  const detectedStatusColName = useMemo<string>(() => {
+    if (!headers || headers.length === 0) return "";
+    return headers.find(h => {
+      const l = h.toLowerCase();
+      return l.includes("status") || l.includes("state");
+    }) || "";
+  }, [headers]);
+
+  const detectedNetworkColName = useMemo<string>(() => {
+    if (!headers || headers.length === 0) return "";
+    return headers.find(h => {
+      const l = h.toLowerCase();
+      return l.includes("network") || l.includes("channel") || l.includes("source") || l.includes("platform") || l.includes("media");
+    }) || "";
+  }, [headers]);
+
+  const detectedMessageColName = useMemo<string>(() => {
+    return selectedMessageCol || headers.find(h => {
+      const l = h.toLowerCase();
+      return l.includes("message") || l.includes("text") || l.includes("desc") || l.includes("body") || l.includes("content");
+    }) || "";
+  }, [headers, selectedMessageCol]);
+
+  // Dashboard Summary metrics
+  const dashboardMetrics = useMemo(() => {
+    const totalCount = filteredRows.length;
+    let openCount = 0;
+    let closedCount = 0;
+    let criticalCount = 0;
+    let resolvedToday = 0;
+
+    const statusColIdx = detectedStatusColName ? headers.indexOf(detectedStatusColName) : -1;
+    const msInDay = 24 * 60 * 60 * 1000;
+    const criticalThresholdMs = 3 * msInDay; // 3 days
+
+    // Find latest timestamp for "today" calculation
+    let maxTimeMs = 0;
+    filteredRows.forEach(row => {
+      const t = new Date(row.timestamp).getTime();
+      if (t > maxTimeMs) maxTimeMs = t;
+    });
+    const todayCutoffMs = maxTimeMs - msInDay;
+
+    filteredRows.forEach(row => {
+      // 1. Open/Closed calculations
+      let isOpen = true;
+      let isClosed = false;
+      if (statusColIdx !== -1) {
+        const s = (row.rawData[statusColIdx] || "").toLowerCase();
+        isClosed = s.includes("close") || s.includes("resolve") || s.includes("complete") || s.includes("done");
+        isOpen = s.includes("open") || s.includes("new") || s.includes("active") || s.includes("pending") || s.includes("escalat") || !isClosed;
+      } else {
+        // Fallback: if age is > 24h, treat as open, else resolved
+        isOpen = row.ageMs > msInDay;
+        isClosed = !isOpen;
+      }
+
+      if (isOpen) openCount++;
+      if (isClosed) closedCount++;
+
+      // 2. Critical cases (> 3 days aging)
+      if (row.ageMs >= criticalThresholdMs && isOpen) {
+        criticalCount++;
+      }
+
+      // 3. Resolved today
+      if (isClosed) {
+        const t = new Date(row.timestamp).getTime();
+        if (t >= todayCutoffMs) {
+          resolvedToday++;
+        }
+      }
+    });
+
+    return {
+      totalCount,
+      openCount,
+      closedCount,
+      avgAgingMs: activeStats?.avgAgeMs || 0,
+      criticalCount,
+      resolvedToday
+    };
+  }, [filteredRows, headers, detectedStatusColName, activeStats]);
+
+  // Aging distribution segmented by days
+  const agingDistribution = useMemo(() => {
+    let g1 = 0; // 0-1 days
+    let g2 = 0; // 1-3 days
+    let g3 = 0; // 3-7 days
+    let g4 = 0; // 7+ days
+
+    const msInDay = 24 * 60 * 60 * 1000;
+    filteredRows.forEach(row => {
+      const d = row.ageMs / msInDay;
+      if (d <= 1) g1++;
+      else if (d <= 3) g2++;
+      else if (d <= 7) g3++;
+      else g4++;
+    });
+
+    const total = filteredRows.length || 1;
+    return [
+      { label: "0–1 Days", count: g1, percentage: (g1 / total) * 100, color: "#10b981" },
+      { label: "1–3 Days", count: g2, percentage: (g2 / total) * 100, color: "#3b82f6" },
+      { label: "3–7 Days", count: g3, percentage: (g3 / total) * 100, color: "#f97316" },
+      { label: "7+ Days", count: g4, percentage: (g4 / total) * 100, color: "#ef4444" }
+    ];
+  }, [filteredRows]);
+
+  // Aging metrics computed dynamically by Status name or fallbacks
+  const statusChartsData = useMemo(() => {
+    const activeCategories = Object.keys(columnCategoryFilters);
+    const groupbyCol = detectedStatusColName || activeCategories[0] || "";
+    if (!stats || !groupbyCol) return [];
+
+    const colIdx = headers.indexOf(groupbyCol);
+    if (colIdx === -1) return [];
+
+    const counts: Record<string, { count: number; sumAgeMs: number; maxAgeMs: number }> = {};
+    
+    filteredRows.forEach(row => {
+      const rawVal = row.rawData[colIdx] || "Unknown";
+      const statusVal = rawVal.trim() === "" ? "Empty" : rawVal;
+      if (!counts[statusVal]) {
+        counts[statusVal] = { count: 0, sumAgeMs: 0, maxAgeMs: 0 };
+      }
+      counts[statusVal].count += 1;
+      counts[statusVal].sumAgeMs += row.ageMs;
+      if (row.ageMs > counts[statusVal].maxAgeMs) {
+        counts[statusVal].maxAgeMs = row.ageMs;
+      }
+    });
+
+    return Object.entries(counts).map(([name, data]) => ({
+      name,
+      count: data.count,
+      avgAgeMs: data.sumAgeMs / data.count,
+      maxAgeMs: data.maxAgeMs
+    })).sort((a, b) => b.count - a.count).slice(0, 5); // top 5 categories
+  }, [filteredRows, headers, detectedStatusColName, columnCategoryFilters, stats]);
+
+  // Escalation priority view: Top 5 unresolved cases sorting by highest ageing
+  const priorityCases = useMemo(() => {
+    let unresolved = [...filteredRows];
+    if (detectedStatusColName) {
+      const statusIdx = headers.indexOf(detectedStatusColName);
+      if (statusIdx !== -1) {
+        unresolved = unresolved.filter(row => {
+          const s = (row.rawData[statusIdx] || "").toLowerCase();
+          return !s.includes("close") && !s.includes("resolve") && !s.includes("complete") && !s.includes("done");
+        });
+      }
+    }
+    // Sort descending by age (oldest first)
+    unresolved.sort((a, b) => b.ageMs - a.ageMs);
+    return unresolved.slice(0, 5);
+  }, [filteredRows, headers, detectedStatusColName]);
+
+  // Handle Export Excel Sheet strictly from currently filtered rows
+  const handleExportExcel = () => {
+    if (!stats || sortedAndFilteredRows.length === 0) return;
+    
+    const dataToExport = sortedAndFilteredRows.map((row, idx) => {
+      const item: Record<string, any> = {
+        "Index": idx + 1,
+        "Timestamp": row.timestamp,
+        "Age (Hours)": Number((row.ageMs / (1000 * 60 * 60)).toFixed(2)),
+        "Age (Days/Hours)": computeAgeText(row.ageMs, "days-hours"),
+        "Primary Msg": row.message,
+      };
+      // Append all other original parsed values
+      headers.forEach((h, hIdx) => {
+        item[h] = row.rawData[hIdx] || "";
+      });
+      return item;
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(dataToExport);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Escalation Matrix Export");
+    
+    // Auto download
+    XLSX.writeFile(workbook, `Sapphire_Escalation_Export_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
   // Sorting handler helper
   const handleSort = (columnKey: string) => {
     if (sortColumn === columnKey) {
@@ -740,63 +1005,137 @@ export default function App() {
     }
   };
 
+  // Recharts Custom Tooltips
+  const CustomTooltipStatus = ({ active, payload }: any) => {
+    if (active && payload && payload.length) {
+      const data = payload[0].payload;
+      return (
+        <div className={`p-3 rounded-xl border text-xs shadow-lg font-sans transition-colors duration-300 ${
+          activeTheme === "dark" ? "bg-[#0c0d0f] border-[#1f2228] text-white" : "bg-white border-slate-200 text-slate-800"
+        }`}>
+          <p className="font-bold mb-1 font-sans">{data.name}</p>
+          <div className="space-y-0.5 font-sans">
+            <p className={activeTheme === "dark" ? "text-slate-300" : "text-slate-600"}>Cases: <strong className="text-orange-500 font-mono">{data.count}</strong></p>
+            <p className={activeTheme === "dark" ? "text-slate-300" : "text-slate-600"}>Avg Age: <strong className="text-blue-500 font-mono">{computeAgeText(data.avgAgeMs, ageDisplayMode)}</strong></p>
+          </div>
+          <p className="text-red-500 font-semibold text-[9px] mt-2 font-mono">Click bar to toggle filter</p>
+        </div>
+      );
+    }
+    return null;
+  };
+
+  const CustomTooltipPie = ({ active, payload }: any) => {
+    if (active && payload && payload.length) {
+      const data = payload[0].payload;
+      return (
+        <div className={`p-3 rounded-xl border text-xs shadow-lg font-sans transition-colors duration-300 ${
+          activeTheme === "dark" ? "bg-[#0c0d0f] border-[#1f2228] text-white" : "bg-white border-slate-200 text-slate-800"
+        }`}>
+          <p className="font-bold mb-1 font-sans" style={{ color: data.color }}>{data.name}</p>
+          <div className="space-y-0.5 font-sans">
+            <p className={activeTheme === "dark" ? "text-slate-300" : "text-slate-600"}>Cases: <strong className="font-mono" style={{ color: data.color }}>{data.value}</strong></p>
+            <p className={activeTheme === "dark" ? "text-slate-300" : "text-slate-600"}>Share: <strong className="text-indigo-500 font-mono">{data.percentage.toFixed(1)}%</strong></p>
+          </div>
+          <p className="text-red-500 font-semibold text-[9px] mt-2 font-mono">Click slice to toggle filter</p>
+        </div>
+      );
+    }
+    return null;
+  };
+
   return (
-    <div id="application-root" className="min-h-screen bg-[#0B0C0E] text-[#E0E0E0] flex flex-col font-sans antialiased selection:bg-orange-600 selection:text-white">
+    <div id="application-root" className={`min-h-screen flex flex-col font-sans antialiased selection:bg-orange-600 selection:text-white transition-colors duration-300 ${
+      activeTheme === "dark" 
+        ? "bg-[#07080a] text-[#E2E8F0]" 
+        : "bg-[#F8FAFC] text-slate-900"
+    }`}>
       
-      {/* Prime Desktop App Header */}
-      <header className="bg-[#0B0C0E] border-b border-[#2A2D35] py-4 px-6 sticky top-0 z-50">
+      {/* Premium Ambient Header */}
+      <header className={`py-4 px-6 sticky top-0 z-50 shadow-sm transition-colors duration-300 ${
+        activeTheme === "dark" ? "bg-[#0c0d0f] border-b border-[#1f2228]" : "bg-white border-b border-gray-200"
+      }`}>
         <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="p-2 bg-[#1A1D23] border border-[#2A2D35] text-[#FF5D22] rounded-lg">
-              <FileSpreadsheet className="w-5.5 h-5.5" />
-            </div>
-            <div>
-              <h1 className="font-sans font-semibold text-base tracking-tight text-white flex items-center gap-1.5">
-                Escalation Matrix
-                <span className="text-[10px] bg-emerald-950/50 border border-emerald-500/20 text-emerald-400 font-mono px-2 py-0.5 rounded-full font-bold">
-                  Streaming Pipeline Live
-                </span>
+            <div className="w-2.5 h-8 bg-orange-500 rounded-sm"></div>
+            <div className="text-left">
+              <h1 className={`text-base font-bold tracking-tight font-sans leading-tight transition-colors duration-300 ${
+                activeTheme === "dark" ? "text-white" : "text-gray-950"
+              }`}>
+                Escalation Matrix App
               </h1>
-              <p className="text-[10px] text-[#8E9299] uppercase tracking-widest mt-0.5 font-mono">
-                Ultra-Lightweight Timestamp Analyzer • Support Cap 1.5M rows
-              </p>
+              <div className={`text-[11px] font-medium transition-colors duration-300 ${
+                activeTheme === "dark" ? "text-gray-400" : "text-gray-600"
+              }`}>
+                Sapphire Retail Limited <span className="mx-1.5">•</span> Customer Experience Department
+              </div>
             </div>
           </div>
 
-          {/* Clock reference manager */}
-          <div className="flex items-center gap-3 bg-[#1A1D23] border border-[#2A2D35] px-3.5 py-2 rounded-lg text-xs font-mono">
-            <Clock className="w-4 h-4 text-orange-500 shrink-0" />
-            <div className="text-left">
-              <span className="text-[9px] text-[#8E9299] uppercase block tracking-wider font-bold">Analysis Reference Time (NOW)</span>
-              <div className="flex items-center gap-2 mt-0.5">
-                {useLiveClock ? (
-                  <span className="text-emerald-400 font-bold font-mono">Browser Live Clock</span>
-                ) : (
-                  <input
-                    type="text"
-                    value={referenceTime}
-                    onChange={(e) => {
-                      setReferenceTime(e.target.value);
+          <div className="flex items-center gap-4">
+            {/* Clock reference manager */}
+            <div className={`flex items-center gap-3 px-3.5 py-2 rounded-lg text-xs font-mono transition-colors duration-300 ${
+              activeTheme === "dark" ? "bg-[#121418] border border-[#21242c]" : "bg-slate-50 border border-slate-200 text-slate-800"
+            }`}>
+              <Clock className="w-4 h-4 text-orange-400 shrink-0" />
+              <div className="text-left">
+                <span className={`text-[9px] uppercase block tracking-wider font-bold transition-colors duration-300 ${
+                  activeTheme === "dark" ? "text-[#A0AEC0]" : "text-slate-500"
+                }`}>Analysis Reference Time (NOW)</span>
+                <div className="flex items-center gap-2 mt-0.5">
+                  {useLiveClock ? (
+                    <span className="text-emerald-505 font-bold font-mono text-[11px]">Browser Live Clock</span>
+                  ) : (
+                    <input
+                      type="text"
+                      value={referenceTime}
+                      onChange={(e) => {
+                        setReferenceTime(e.target.value);
+                        setCurrentPage(1);
+                      }}
+                      className={`text-xs font-mono px-2 py-0.5 rounded focus:outline-none focus:border-orange-500 w-44 inline-block transition-colors duration-300 ${
+                        activeTheme === "dark" ? "bg-[#0c0d0f] text-[#E2E8F0] border border-[#262a34]" : "bg-white text-slate-900 border-slate-300"
+                      }`}
+                    />
+                  )}
+                  <div className={`h-3.5 w-px mx-1 transition-colors duration-300 ${activeTheme === "dark" ? "bg-[#262a34]" : "bg-slate-200"}`}></div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUseLiveClock(!useLiveClock);
                       setCurrentPage(1);
                     }}
-                    className="bg-[#0B0C0E] text-[#E0E0E0] border border-[#2A2D35] text-xs font-mono px-2 py-0.5 rounded focus:outline-none focus:border-orange-500 w-44 inline-block"
-                  />
-                )}
-                <div className="h-3.5 w-px bg-[#2A2D35] mx-1"></div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setUseLiveClock(!useLiveClock);
-                    setCurrentPage(1);
-                  }}
-                  className={`text-[10px] uppercase tracking-wider font-bold px-1.5 py-0.5 rounded cursor-pointer ${
-                    useLiveClock ? "bg-orange-950/30 text-orange-400 border border-orange-500/10" : "bg-[#2A2D35] text-white hover:bg-[#3E424B]"
-                  }`}
-                >
-                  {useLiveClock ? "Lock Reference Time" : "Set Live Mode"}
-                </button>
+                    className={`text-[10px] uppercase tracking-wider font-bold px-1.5 py-0.5 rounded cursor-pointer transition-colors duration-300 ${
+                      useLiveClock 
+                        ? "bg-orange-950/20 text-orange-400 border border-orange-500/25" 
+                        : activeTheme === "dark"
+                          ? "bg-[#20232a] text-[#E2E8F0] hover:bg-[#2e323c]"
+                          : "bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 shadow-xs"
+                    }`}
+                  >
+                    {useLiveClock ? "Lock Reference" : "Set Live Mode"}
+                  </button>
+                </div>
               </div>
             </div>
+
+            {/* Premium Theme Toggle button */}
+            <button
+              type="button"
+              onClick={toggleTheme}
+              className={`p-2.5 rounded-lg border flex items-center justify-center transition-all cursor-pointer ${
+                activeTheme === "dark"
+                  ? "bg-[#121418] hover:bg-[#1C1F26] border-[#21242c] text-orange-400 hover:text-orange-300 hover:shadow-cyan-500/50"
+                  : "bg-white hover:bg-slate-50 border-slate-200 text-slate-800 shadow-xs"
+              }`}
+              title={activeTheme === "dark" ? "Switch to Light Mode" : "Switch to Dark Mode"}
+            >
+              {activeTheme === "dark" ? (
+                <Sun className="w-4.5 h-4.5 text-orange-400" />
+              ) : (
+                <Moon className="w-4.5 h-4.5 text-slate-750" />
+              )}
+            </button>
           </div>
         </div>
       </header>
@@ -1131,290 +1470,983 @@ export default function App() {
         {step === "dashboard" && stats && (
           <div id="step-dashboard-view" className="space-y-6 animate-fadeIn w-full">
             
-            {/* Top overview layout */}
-            <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 border-b border-[#2A2D35] pb-5">
+            {/* 1. TOP OVERVIEW / ACTION HEADER */}
+            <div className={`flex flex-col md:flex-row items-start md:items-center justify-between gap-4 border-b pb-5 transition-colors duration-300 ${
+              activeTheme === "dark" ? "border-slate-800" : "border-slate-250"
+            }`}>
               <div>
-                <span className="text-[10px] bg-orange-950/40 border border-orange-500/20 text-orange-400 font-mono px-2 py-0.5 rounded uppercase font-bold tracking-wider">
-                  Analysis Pipeline Result Complete
-                </span>
-                <h2 className="text-xl font-bold tracking-tight text-white mt-1.5 flex items-center gap-2">
-                  <FileSpreadsheet className="w-5 h-5 text-orange-500" />
-                  Dataset Timestamp Analysis Dashboard
+                <h2 className={`text-2xl font-bold tracking-tight font-sans ${
+                  activeTheme === "dark" ? "text-white" : "text-slate-900"
+                }`}>
+                  Dashboard
                 </h2>
-                <p className="text-xs text-[#8E9299] mt-0.5">
-                  Chronological calculation relative to: <span className="text-orange-400 font-bold font-mono">{getActiveReferenceTime().toUTCString()}</span>
-                </p>
+                <div className={`text-xs mt-1 font-medium font-sans ${
+                  activeTheme === "dark" ? "text-slate-400" : "text-slate-600"
+                }`}>
+                  Sapphire Retail Limited <span className="mx-1.5">•</span> Customer Experience Department
+                </div>
+                <div className={`text-[11px] font-mono mt-1 ${
+                  activeTheme === "dark" ? "text-slate-500" : "text-slate-500"
+                }`}>
+                  Date Calculation Based: {getActiveReferenceTime().toUTCString()}
+                </div>
               </div>
 
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectedFile(null);
-                  setStats(null);
-                  setExpandedRowIdx(null);
-                  setSelectedCategoryFilters({});
-                  setSortColumn(null);
-                  setSortDirection("desc");
-                  setSearchQuery("");
-                  setPageSize(50);
-                  setCurrentPage(1);
-                  setStep("import");
-                }}
-                className="px-4 py-2 bg-[#1A1D23] hover:bg-[#2A2D35] border border-[#2A2D35] hover:border-[#3E424B] text-white text-xs font-semibold rounded flex items-center gap-2 transition cursor-pointer"
-              >
-                <ArrowLeft className="w-4 h-4" /> Reset & Import Another File
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleExportExcel}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 border border-emerald-500/10 text-white text-xs font-semibold rounded-lg flex items-center gap-2 transition cursor-pointer shadow-sm font-sans"
+                >
+                  <FileSpreadsheet className="w-4 h-4" /> Export Excel
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedFile(null);
+                    setStats(null);
+                    setExpandedRowIdx(null);
+                    setSelectedCategoryFilters({});
+                    setSortColumn(null);
+                    setSortDirection("desc");
+                    setSearchQuery("");
+                    setDateStartFilter("");
+                    setDateEndFilter("");
+                    setMinAgeHours("");
+                    setMaxAgeHours("");
+                    setPageSize(50);
+                    setCurrentPage(1);
+                    setStep("import");
+                  }}
+                  className={`px-4 py-2 border text-xs font-semibold rounded-lg flex items-center gap-2 transition cursor-pointer font-sans transition-colors duration-300 ${
+                    activeTheme === "dark"
+                      ? "bg-[#121418] hover:bg-[#1a1c22] border-[#21242c] text-white"
+                      : "bg-white hover:bg-slate-50 border-slate-200 text-slate-800 shadow-xs"
+                  }`}
+                >
+                  <ArrowLeft className="w-4 h-4" /> Reset Workspace
+                </button>
+              </div>
             </div>
 
-            {/* SPLIT VIEW WORKSPACE */}
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            {/* 2. REQUIRED HORIZONTAL SUMMARY CARDS */}
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+              {/* Total Cases */}
+              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80 text-white" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                }`}>Total Active Cases</span>
+                <div className="flex items-baseline gap-1.5">
+                  <strong className={`text-2xl font-bold font-mono tracking-tight transition-colors duration-300 ${
+                    activeTheme === "dark" ? "text-white" : "text-slate-990"
+                  }`}>
+                    {dashboardMetrics.totalCount.toLocaleString()}
+                  </strong>
+                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>rows</span>
+                </div>
+              </div>
+
+              {/* Open Cases */}
+              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                }`}>Open Cases</span>
+                <div className="flex items-baseline gap-1.5">
+                  <strong className="text-2xl font-bold font-mono text-orange-550 tracking-tight">
+                    {dashboardMetrics.openCount.toLocaleString()}
+                  </strong>
+                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>pending</span>
+                </div>
+              </div>
+
+              {/* Closed Cases */}
+              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                }`}>Closed Cases</span>
+                <div className="flex items-baseline gap-1.5">
+                  <strong className="text-2xl font-bold font-mono text-emerald-555 tracking-tight">
+                    {dashboardMetrics.closedCount.toLocaleString()}
+                  </strong>
+                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>settled</span>
+                </div>
+              </div>
+
+              {/* Avg Aging */}
+              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                }`}>Avg Aging</span>
+                <div className="flex items-baseline gap-1">
+                  <strong className={`text-base font-bold font-mono tracking-tight leading-none truncate block max-w-full ${
+                    activeTheme === "dark" ? "text-blue-400" : "text-blue-600"
+                  }`}>
+                    {computeAgeText(dashboardMetrics.avgAgingMs, ageDisplayMode)}
+                  </strong>
+                </div>
+              </div>
+
+              {/* Critical Aging Cases */}
+              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                }`}>Critical Unresolved</span>
+                <div className="flex items-baseline gap-1.5">
+                  <strong className="text-2xl font-bold font-mono text-red-500 tracking-tight">
+                    {dashboardMetrics.criticalCount.toLocaleString()}
+                  </strong>
+                  <span className="text-[10px] text-red-400/90 font-sans">&gt; 3d old</span>
+                </div>
+              </div>
+
+              {/* Resolved Today */}
+              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                }`}>Resolved Today</span>
+                <div className="flex items-baseline gap-1.5">
+                  <strong className="text-2xl font-bold font-mono text-indigo-500 tracking-tight">
+                    {dashboardMetrics.resolvedToday.toLocaleString()}
+                  </strong>
+                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-indigo-400/90" : "text-indigo-600/90"}`}>last 24h</span>
+                </div>
+              </div>
+            </div>
+
+            {/* 3. CHARTS GRID (Aging by status / Aging distribution / Escalation priority heatmap) */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
               
-              {/* LEFT SIDE: FULL original dataset viewer with computed Age (Scrollable) */}
-              <div className="lg:col-span-8 space-y-4">
-                
-                {/* Search & pagination rows per page control header */}
-                <div className="bg-[#15171C] border border-[#2A2D35] rounded-xl p-4 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-                  <div className="space-y-1">
-                    <h3 className="text-sm font-semibold text-white flex items-center gap-1.5">
-                      <Eye className="w-4 h-4 text-orange-500" />
-                      Original Dataset Master Viewer
-                    </h3>
-                    <p className="text-[11px] text-[#8E9299]">
-                      Displaying rows {sortedAndFilteredRows.length > 0 ? (currentPage - 1) * pageSize + 1 : 0} to {Math.min(currentPage * pageSize, sortedAndFilteredRows.length)} of {sortedAndFilteredRows.length} matched rows.
-                    </p>
+              {/* CHARTS CARD 1: Aging by Status */}
+              <div className={`lg:col-span-4 rounded-xl p-5 space-y-4 transition-colors duration-300 border ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80 text-white" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <div className={`pb-3 border-b transition-colors duration-300 ${
+                  activeTheme === "dark" ? "border-slate-800" : "border-slate-100"
+                }`}>
+                  <h3 className={`text-xs uppercase tracking-wider font-bold ${
+                    activeTheme === "dark" ? "text-orange-400" : "text-orange-600"
+                  }`}>
+                    1. Case Category Aging Breakdown
+                  </h3>
+                </div>
+
+                {statusChartsData.length === 0 ? (
+                  <div className={`py-12 text-center text-xs font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>
+                    No status variable or categorical data found in dataset
                   </div>
-
-                  <div className="flex flex-wrap items-center gap-3 w-full md:w-auto">
-                    {/* Multi-column Search query inputs */}
-                    <div className="relative flex-1 md:flex-initial min-w-[240px]">
-                      <Search className="w-3.5 h-3.5 text-[#8E9299] absolute left-3 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="text"
-                        placeholder="Search any field or age..."
-                        value={searchQuery}
-                        onChange={(e) => {
-                          setSearchQuery(e.target.value);
-                          setCurrentPage(1);
-                        }}
-                        className="w-full pl-9 pr-3 py-1.5 bg-[#0B0C0E] border border-[#2A2D35] rounded-md text-xs font-sans text-white placeholder-[#8E9299] focus:outline-none focus:border-orange-500"
-                      />
-                    </div>
-
-                    {/* Page Size selector */}
-                    <div className="flex items-center gap-1.5 text-xs text-[#8E9299]">
-                      <span>Page size:</span>
-                      <select
-                        value={pageSize}
-                        onChange={(e) => {
-                          setPageSize(Number(e.target.value));
-                          setCurrentPage(1);
-                        }}
-                        className="bg-[#0B0C0E] border border-[#2A2D35] text-white text-xs rounded px-2 py-1 focus:outline-none focus:border-orange-500 font-mono"
+                ) : (
+                  <div className="h-[250px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart 
+                        data={statusChartsData} 
+                        margin={{ top: 10, right: 10, left: -20, bottom: 0 }}
                       >
-                        <option value={10}>10</option>
-                        <option value={20}>20</option>
-                        <option value={50}>50</option>
-                        <option value={100}>100</option>
-                        <option value={500}>500</option>
-                      </select>
-                    </div>
+                        <XAxis 
+                          dataKey="name" 
+                          stroke={activeTheme === "dark" ? "#64748b" : "#475569"} 
+                          fontSize={10} 
+                          tickLine={false} 
+                          axisLine={false}
+                          tickFormatter={(v) => v.length > 8 ? `${v.substring(0, 8)}...` : v}
+                        />
+                        <YAxis 
+                          stroke={activeTheme === "dark" ? "#64748b" : "#475569"} 
+                          fontSize={9} 
+                          tickLine={false} 
+                          axisLine={false}
+                        />
+                        <Tooltip content={<CustomTooltipStatus />} cursor={{ fill: activeTheme === "dark" ? "rgba(255, 255, 255, 0.04)" : "rgba(0,0,0,0.02)" }} />
+                        <Bar 
+                          dataKey="count" 
+                          radius={[4, 4, 0, 0]} 
+                          animationDuration={1000}
+                        >
+                          {statusChartsData.map((entry, index) => (
+                            <Cell 
+                              key={`cell-${index}`} 
+                              fill={
+                                index === 0 ? "#FF5D22" :
+                                index === 1 ? "#3b82f6" :
+                                index === 2 ? "#10b981" :
+                                index === 3 ? "#a855f7" : "#06b6d4"
+                              } 
+                              onClick={() => {
+                                const activeCategories = Object.keys(columnCategoryFilters);
+                                const groupbyCol = detectedStatusColName || activeCategories[0] || "";
+                                if (groupbyCol) {
+                                  setSelectedCategoryFilters(prev => ({
+                                    ...prev,
+                                    [groupbyCol]: prev[groupbyCol] === entry.name ? "" : entry.name
+                                  }));
+                                  setCurrentPage(1);
+                                }
+                              }}
+                              className="cursor-pointer hover:opacity-85 transition-opacity duration-200"
+                            />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+                
+                {(() => {
+                  const actCats = Object.keys(columnCategoryFilters);
+                  const activeColName = detectedStatusColName || actCats[0] || "";
+                  if (activeColName) {
+                    return (
+                      <div className={`text-[10px] text-center font-mono transition-colors duration-300 ${
+                        activeTheme === "dark" ? "text-slate-500" : "text-slate-400"
+                      }`}>
+                        Filtering dimension: <span className="text-orange-500 font-bold">{activeColName}</span>
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
+              </div>
+
+              {/* CHARTS CARD 2: Aging Distribution */}
+              <div className={`lg:col-span-4 rounded-xl p-5 space-y-4 transition-colors duration-300 border ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80 text-white" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <div className={`pb-3 border-b transition-colors duration-300 ${
+                  activeTheme === "dark" ? "border-slate-800" : "border-slate-100"
+                }`}>
+                  <h3 className={`text-xs uppercase tracking-wider font-bold ${
+                    activeTheme === "dark" ? "text-blue-400" : "text-blue-600"
+                  }`}>
+                    2. Chronological Backlog Distribution
+                  </h3>
+                </div>
+
+                {/* Highly elegant interactive Recharts Pie Donut Chart */}
+                <div className="h-[210px] w-full relative flex items-center justify-center">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Tooltip content={<CustomTooltipPie />} />
+                      <Pie
+                        data={agingDistribution.map(item => ({
+                          name: item.label,
+                          value: item.count,
+                          percentage: item.percentage,
+                          color: item.color
+                        }))}
+                        innerRadius="58%"
+                        outerRadius="82%"
+                        paddingAngle={4}
+                        dataKey="value"
+                        className="cursor-pointer"
+                        animationDuration={800}
+                        onClick={(e) => {
+                          if (e && e.name) {
+                            let min = "";
+                            let max = "";
+                            if (e.name === "0–1 Days") {
+                              min = "0";
+                              max = "24";
+                            } else if (e.name === "1–3 Days") {
+                              min = "24";
+                              max = "72";
+                            } else if (e.name === "3–7 Days") {
+                              min = "72";
+                              max = "168";
+                            } else if (e.name === "7+ Days") {
+                              min = "168";
+                              max = "999999";
+                            }
+
+                            if (minAgeHours === min && maxAgeHours === max) {
+                              setMinAgeHours("");
+                              setMaxAgeHours("");
+                            } else {
+                              setMinAgeHours(min);
+                              setMaxAgeHours(max);
+                            }
+                            setCurrentPage(1);
+                          }
+                        }}
+                      >
+                        {agingDistribution.map((entry, index) => (
+                          <Cell 
+                            key={`cell-${index}`} 
+                            fill={entry.color} 
+                            stroke={activeTheme === "dark" ? "#07080a" : "#fff"}
+                            strokeWidth={2.5}
+                            className="hover:opacity-95 hover:scale-102 transition-transform duration-200 origin-center"
+                          />
+                        ))}
+                      </Pie>
+                    </PieChart>
+                  </ResponsiveContainer>
+                  
+                  {/* Subtle Center Total Label */}
+                  <div className="absolute flex flex-col items-center justify-center pointer-events-none">
+                    <span className={`text-[10px] uppercase font-bold tracking-wider ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>Backlog</span>
+                    <strong className={`text-xl font-bold font-mono tracking-tight ${activeTheme === "dark" ? "text-white" : "text-slate-800"}`}>
+                      {dashboardMetrics.totalCount.toLocaleString()}
+                    </strong>
                   </div>
                 </div>
 
-                {/* ROW-LEVEL CATEGORICAL FILTERS (Auto-Detected) */}
-                {Object.keys(columnCategoryFilters).length > 0 && (
-                  <div className="bg-[#1C1F26]/40 border border-[#2A2D35]/60 rounded-xl p-3.5 space-y-2.5 shadow-sm">
-                    <div className="flex items-center justify-between border-b border-[#2A2D35]/30 pb-2">
-                      <div className="flex items-center gap-2 text-xs font-bold text-orange-400 uppercase tracking-wider">
-                        <Filter className="w-3.5 h-3.5 text-orange-500" />
-                        <span>Dynamic Field Filters</span>
+                {/* Legend list matching Recharts colors */}
+                <div className="grid grid-cols-2 gap-2 pt-1">
+                  {agingDistribution.map(seg => {
+                    const mappedMin = seg.label === "0–1 Days" ? "0" : seg.label === "1–3 Days" ? "24" : seg.label === "3–7 Days" ? "72" : "168";
+                    const isSelected = minAgeHours === mappedMin;
+                    return (
+                      <button 
+                        key={seg.label} 
+                        type="button"
+                        onClick={() => {
+                          let min = "";
+                          let max = "";
+                          if (seg.label === "0–1 Days") { min = "0"; max = "24"; }
+                          else if (seg.label === "1–3 Days") { min = "24"; max = "72"; }
+                          else if (seg.label === "3–7 Days") { min = "72"; max = "168"; }
+                          else if (seg.label === "7+ Days") { min = "168"; max = "999999"; }
+
+                          if (minAgeHours === min && maxAgeHours === max) {
+                            setMinAgeHours("");
+                            setMaxAgeHours("");
+                          } else {
+                            setMinAgeHours(min);
+                            setMaxAgeHours(max);
+                          }
+                          setCurrentPage(1);
+                        }}
+                        className={`p-1.5 rounded-lg border text-left flex items-center gap-2 transition cursor-pointer ${
+                          isSelected 
+                            ? "bg-orange-500/10 border-orange-505/50" 
+                            : activeTheme === "dark" 
+                              ? "bg-gray-950/45 border-slate-800 hover:border-slate-700" 
+                              : "bg-slate-50 border-slate-200 hover:border-slate-300"
+                        }`}
+                      >
+                        <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: seg.color }} />
+                        <div className="min-w-0">
+                          <span className={`text-[9px] uppercase font-bold tracking-wider block ${
+                            activeTheme === "dark" ? "text-gray-400" : "text-slate-500"
+                          }`}>{seg.label}</span>
+                          <span className={`font-mono text-[10px] font-bold block ${
+                            activeTheme === "dark" ? "text-white" : "text-slate-800"
+                          }`}>
+                            {seg.count.toLocaleString()} <span className="font-sans font-normal text-gray-500 text-[9px]">({seg.percentage.toFixed(0)}%)</span>
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* CHARTS CARD 3: Escalation Priority View */}
+              <div className={`lg:col-span-4 rounded-xl p-5 space-y-4 transition-colors duration-300 border ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80 text-white" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <div className={`pb-3 border-b transition-colors duration-300 ${
+                  activeTheme === "dark" ? "border-slate-800" : "border-slate-100"
+                }`}>
+                  <h3 className={`text-xs uppercase tracking-wider font-bold ${
+                    activeTheme === "dark" ? "text-red-400" : "text-red-600"
+                  }`}>
+                    3. Unresolved Aging SLA Escalations
+                  </h3>
+                </div>
+
+                <div className="space-y-2 max-h-[250px] overflow-y-auto pr-1">
+                  {priorityCases.length === 0 ? (
+                    <div className="py-12 text-center text-xs text-gray-400 italic font-sans">
+                      Zero unresolved cases in current active selection.
+                    </div>
+                  ) : (
+                    priorityCases.map((row, idx) => {
+                      return (
+                        <div 
+                          key={idx}
+                          className={`p-2.5 rounded-lg border transition duration-300 flex items-center justify-between gap-3 text-xs ${
+                            activeTheme === "dark"
+                              ? "bg-slate-950/30 border-red-500/15 hover:border-red-500/40 hover:shadow-[0_0_12px_rgba(239,68,68,0.08)] text-slate-200"
+                              : "bg-red-50/20 border-red-200 hover:border-red-400 hover:shadow-[0_2px_8px_rgba(239,68,68,0.06)] text-slate-800"
+                          }`}
+                        >
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <div className="flex items-center gap-2">
+                              <span className="text-[9px] bg-red-500/10 border border-red-500/25 text-red-505 px-1.5 py-0.5 rounded-sm font-mono font-bold uppercase tracking-wider animate-pulse">
+                                ALERT #{idx + 1}
+                              </span>
+                              <span className="text-[10px] text-slate-500 font-mono truncate max-w-[125px]" title={row.timestamp}>
+                                {row.timestamp}
+                              </span>
+                            </div>
+                            <p className={`text-[11px] truncate pr-2 font-sans ${activeTheme === "dark" ? "text-slate-300" : "text-slate-700"}`}>
+                              {row.message || "No activity message text provided"}
+                            </p>
+                          </div>
+                          
+                          <div className="text-right shrink-0">
+                            <span className={`text-[9px] block uppercase font-bold tracking-wider mb-0.5 font-sans ${
+                              activeTheme === "dark" ? "text-slate-500" : "text-slate-400"
+                            }`}>AGING</span>
+                            <strong className="text-red-500 font-mono font-bold text-xs">
+                              {computeAgeText(row.ageMs, ageDisplayMode)}
+                            </strong>
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+
+            </div>
+
+            {/* 4. MASTER COMPACT DATA VIEWPORT ZONE */}
+            <div className="space-y-4">
+              
+              {/* Dataset control panel containing search query and collapsible Dropdown filter trigger */}
+              <div className="bg-[#0c0d0f] border border-[#1f2228] rounded-xl p-4 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <Database className="w-4 h-4 text-orange-400" />
+                    Operational Grid Table Room
+                  </h3>
+                  <p className="text-[11px] text-gray-400 leading-none font-sans">
+                    Currently rendering <span className="text-white font-bold font-mono">{sortedAndFilteredRows.length}</span> active cases from master file stream
+                  </p>
+                </div>
+
+                {/* Filters Trigger + Reset Action Panel */}
+                <div className="flex flex-wrap items-center gap-3">
+                  {/* Collapsible dropdown filter panel button trigger */}
+                  <button
+                    type="button"
+                    onClick={() => setIsFilterOpen(!isFilterOpen)}
+                    className={`px-4 py-2 text-xs font-bold rounded flex items-center gap-2 border transition-all cursor-pointer font-sans ${
+                      isFilterOpen 
+                        ? "bg-orange-600 border-orange-500 text-white shadow" 
+                        : "bg-gray-950 border-[#1f2228] hover:border-gray-500 text-white hover:bg-gray-900"
+                    }`}
+                  >
+                    <Filter className="w-4 h-4" /> 
+                    <span>Filters Selection</span>
+                    <span className="text-[10px] font-mono">{isFilterOpen ? "▲" : "▼"}</span>
+                  </button>
+
+                  <select
+                    value={pageSize}
+                    onChange={(e) => {
+                      setPageSize(Number(e.target.value));
+                      setCurrentPage(1);
+                    }}
+                    className="bg-gray-950 border border-[#1f2228] text-white text-xs rounded px-3 py-2 font-mono focus:outline-none focus:border-orange-500"
+                  >
+                    <option value={10}>Show 10 Rows</option>
+                    <option value={20}>Show 20 Rows</option>
+                    <option value={50}>Show 50 Rows</option>
+                    <option value={100}>Show 100 Rows</option>
+                    <option value={500}>Show 500 Rows</option>
+                  </select>
+
+                  <div className="flex bg-gray-950 p-0.5 rounded border border-[#1f2228] text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setAgeDisplayMode("days-hours")}
+                      className={`px-3 py-1.5 text-[10px] uppercase font-bold rounded transition-colors cursor-pointer ${
+                        ageDisplayMode === "days-hours"
+                          ? "bg-[#21242c] text-white"
+                          : "text-gray-450 hover:text-white"
+                      }`}
+                    >
+                      Days & Hrs
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAgeDisplayMode("total-hours")}
+                      className={`px-3 py-1.5 text-[10px] uppercase font-bold rounded transition-colors cursor-pointer ${
+                        ageDisplayMode === "total-hours"
+                          ? "bg-[#21242c] text-white"
+                          : "text-gray-455 hover:text-white"
+                      }`}
+                    >
+                      Total Hrs
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Collapsible Dropdown Filter Smooth Panel containing Status, Date, Network, Message Type, Age, Search */}
+              {isFilterOpen && (
+                <div className="bg-[#0c0d0f] border border-[#1f2228] rounded-xl p-5 space-y-4 animate-slideDown shadow-lg">
+                  <div className="flex items-center justify-between border-b border-[#1f2228] pb-2">
+                    <span className="text-xs font-bold text-orange-400 uppercase tracking-widest font-sans">
+                      Corporate Filters Configuration Dashboard
+                    </span>
+                    <button 
+                      onClick={() => setIsFilterOpen(false)}
+                      className="text-gray-400 hover:text-white text-xs font-bold font-mono"
+                    >
+                      [ Close Panel ✕ ]
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                    {/* Filter 1: Universal Search input */}
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block font-sans">
+                        Search Log Records
+                      </label>
+                      <div className="relative">
+                        <Search className="w-3.5 h-3.5 text-gray-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          placeholder="Search any keyword or columns..."
+                          value={searchQuery}
+                          onChange={(e) => {
+                            setSearchQuery(e.target.value);
+                            setCurrentPage(1);
+                          }}
+                          className="w-full pl-9 pr-3 py-2 bg-gray-950 border border-[#1f2228] rounded text-xs text-white placeholder-gray-650 focus:outline-none focus:border-orange-500 font-mono"
+                        />
                       </div>
-                      <span className="text-[10px] text-[#8E9299]">
-                        Auto-detected discrete categories (Status, Queue, Priority, etc.)
-                      </span>
                     </div>
 
-                    <div className="flex flex-wrap items-center gap-3">
-                      {(Object.entries(columnCategoryFilters) as [string, string[]][]).map(([colName, uniqueValues]) => {
-                        const currentValue = selectedCategoryFilters[colName] || "";
-                        return (
-                          <div key={colName} className="flex items-center gap-2 text-xs bg-[#121418] border border-[#2A2D35]/80 rounded-lg px-2.5 py-1.5 shadow-sm hover:border-[#3E424B] transition-colors">
-                            <span className="text-[#8E9299] select-none font-medium">{colName}:</span>
-                            <select
-                              value={currentValue}
-                              onChange={(e) => {
-                                setSelectedCategoryFilters(prev => ({
-                                  ...prev,
-                                  [colName]: e.target.value
-                                }));
-                                setCurrentPage(1);
-                              }}
-                              className="bg-transparent text-white font-bold text-xs focus:outline-none border-none py-0.5 cursor-pointer max-w-[130px] truncate"
-                            >
-                              <option value="" className="bg-[#121418] text-[#8E9299]">All Columns</option>
-                              {uniqueValues.map(v => (
-                                <option key={v} value={v} className="bg-[#121418] text-white">
-                                  {v}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        );
-                      })}
+                    {/* Filter 2: Custom Category filters (Status & Network) mapped cleanly */}
+                    {(Object.entries(columnCategoryFilters) as [string, string[]][]).map(([colName, uniqueValues]) => {
+                      const isStatusCol = colName === detectedStatusColName;
+                      const isNetworkCol = colName === detectedNetworkColName;
+                      const currentValue = selectedCategoryFilters[colName] || "";
+                      
+                      return (
+                        <div key={colName} className="space-y-1.5">
+                          <label className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block truncate font-sans" title={colName}>
+                            Filter by {colName} {isStatusCol ? "(Status)" : isNetworkCol ? "(Source Network)" : ""}
+                          </label>
+                          <select
+                            value={currentValue}
+                            onChange={(e) => {
+                              setSelectedCategoryFilters(prev => ({
+                                ...prev,
+                                [colName]: e.target.value
+                              }));
+                              setCurrentPage(1);
+                            }}
+                            className="w-full py-2 bg-gray-950 border border-[#1f2228] rounded text-xs text-white focus:outline-none focus:border-orange-500 font-mono"
+                          >
+                            <option value="">-- All Mappings ({uniqueValues.length} discrete) --</option>
+                            {uniqueValues.map(v => (
+                              <option key={v} value={v}>{v}</option>
+                            ))}
+                          </select>
+                        </div>
+                      );
+                    })}
 
-                      {Object.values(selectedCategoryFilters).some(v => v !== "") && (
-                        <button
-                          type="button"
-                          onClick={clearCategoryFilters}
-                          className="text-[11px] text-orange-400 hover:text-orange-300 font-bold flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-orange-950/20 rounded-md transition border border-orange-500/20 cursor-pointer"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" /> Clear Filters
-                        </button>
-                      )}
+                    {/* Filter 3: Date Timeline filter interval */}
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block font-sans">
+                        Timeline Interval (Start Date)
+                      </label>
+                      <div className="relative">
+                        <Calendar className="w-3.5 h-3.5 text-gray-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                        <input
+                          type="date"
+                          value={dateStartFilter}
+                          onChange={(e) => {
+                            setDateStartFilter(e.target.value);
+                            setCurrentPage(1);
+                          }}
+                          className="w-full pl-9 pr-3 py-2 bg-gray-950 border border-[#1f2228] rounded text-xs text-white focus:outline-none focus:border-orange-500 font-mono cursor-pointer"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Filter 4: Date Timeline filter interval (End) */}
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block font-sans">
+                        Timeline Interval (End Date)
+                      </label>
+                      <div className="relative">
+                        <Calendar className="w-3.5 h-3.5 text-gray-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                        <input
+                          type="date"
+                          value={dateEndFilter}
+                          onChange={(e) => {
+                            setDateEndFilter(e.target.value);
+                            setCurrentPage(1);
+                          }}
+                          className="w-full pl-9 pr-3 py-2 bg-gray-950 border border-[#1f2228] rounded text-xs text-white focus:outline-none focus:border-orange-500 font-mono cursor-pointer"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Filter 5: Numeric Age filter interval bounds (Min/Max Hours) */}
+                    <div className="space-y-1.5 col-span-1 md:col-span-2 lg:col-span-1">
+                      <label className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block font-sans">
+                        Computed Age limits (Hours interval)
+                      </label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <input
+                          type="number"
+                          placeholder="Min (hrs)"
+                          value={minAgeHours}
+                          onChange={(e) => {
+                            setMinAgeHours(e.target.value);
+                            setCurrentPage(1);
+                          }}
+                          className="w-full px-3 py-2 bg-gray-950 border border-[#1f2228] rounded text-xs text-white placeholder-gray-700 focus:outline-none focus:border-orange-500 font-mono animate-none"
+                        />
+                        <input
+                          type="number"
+                          placeholder="Max (hrs)"
+                          value={maxAgeHours}
+                          onChange={(e) => {
+                            setMaxAgeHours(e.target.value);
+                            setCurrentPage(1);
+                          }}
+                          className="w-full px-3 py-2 bg-gray-950 border border-[#1f2228] rounded text-xs text-white placeholder-gray-700 focus:outline-none focus:border-orange-500 font-mono animate-none"
+                        />
+                      </div>
                     </div>
                   </div>
-                )}
 
-                {/* SCROLLABLE TABLE VIEWER CONTAINER */}
-                <div className="bg-[#15171C] border border-[#2A2D35] rounded-xl overflow-hidden shadow-lg">
-                  <div className="overflow-x-auto overflow-y-auto max-h-[640px] relative scrollbar-thin scrollbar-thumb-orange-600/30">
-                    <table className="w-full text-left font-sans text-xs whitespace-nowrap select-none table-auto">
-                      <thead className="sticky top-0 bg-[#121418] z-10 border-b border-[#2A2D35]">
-                        <tr className="text-[#8E9299] uppercase text-[10px] tracking-wider font-bold select-none">
-                          <th className="px-4 py-3.5 border-r border-[#2A2D35] text-center w-12 bg-[#121418]">Index</th>
-                          {headers.map((h, hIdx) => {
-                            const isTs = h === selectedTimestampCol;
-                            return (
-                              <th 
-                                key={hIdx} 
-                                onClick={() => handleSort(h)}
-                                className={`px-4 py-3.5 border-r border-[#2A2D35] text-left bg-[#121418] font-bold cursor-pointer hover:bg-[#1A1D23] transition group ${
-                                  isTs ? "text-orange-400 bg-orange-950/20 hover:bg-orange-950/30" : ""
-                                }`}
-                                title={`Click to sort by ${h}`}
-                              >
-                                <div className="flex items-center justify-between gap-1.5">
-                                  <span>{h}</span>
-                                  {renderSortIndicator(h)}
-                                </div>
-                              </th>
-                            );
-                          })}
+                  <div className="pt-2.5 flex items-center justify-between border-t border-[#1f2228]/50">
+                    <span className="text-[11px] text-gray-500 font-mono">
+                      Calculations will auto-update across chronological charts and tables instantly
+                    </span>
+                    <button
+                      type="button"
+                      onClick={clearCategoryFilters}
+                      className="text-xs text-orange-400 hover:text-orange-300 font-bold flex items-center gap-1.5 hover:underline cursor-pointer font-sans"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Clear All Filters
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* ACTIVE FILTER BADGES ROW (Instagram, status level, etc.) */}
+              {(searchQuery.trim() !== "" || 
+                Object.values(selectedCategoryFilters).some(v => v !== "") ||
+                dateStartFilter !== "" || 
+                dateEndFilter !== "" || 
+                minAgeHours !== "" || 
+                maxAgeHours !== "") && (
+                <div className="flex flex-wrap items-center gap-2 pt-1 font-mono">
+                  <span className="text-[10px] text-gray-500 font-bold uppercase mr-1 font-sans">Active Filters:</span>
+                  
+                  {searchQuery.trim() !== "" && (
+                    <span className="text-[10px] bg-gray-900 border border-[#1f2228] text-white pl-2.5 pr-1.5 py-1 rounded-full flex items-center gap-1.5">
+                      <span>Search: "{searchQuery}"</span>
+                      <button onClick={() => { setSearchQuery(""); setCurrentPage(1); }} className="hover:text-red-400 text-gray-500 font-bold text-[11px] leading-none px-1">✕</button>
+                    </span>
+                  )}
+
+                  {Object.entries(selectedCategoryFilters).map(([col, val]) => (
+                    val !== "" ? (
+                      <span key={col} className="text-[10px] bg-orange-950/20 border border-orange-500/20 text-orange-400 pl-2.5 pr-1.5 py-1 rounded-full flex items-center gap-1.5">
+                        <span>{val}</span>
+                        <button onClick={() => {
+                          setSelectedCategoryFilters(prev => ({ ...prev, [col]: "" }));
+                          setCurrentPage(1);
+                        }} className="hover:text-red-450 text-orange-300 font-bold text-[11px] leading-none px-1">✕</button>
+                      </span>
+                    ) : null
+                  ))}
+
+                  {dateStartFilter !== "" && (
+                    <span className="text-[10px] bg-blue-950/20 border border-blue-500/20 text-blue-400 pl-2.5 pr-1.5 py-1 rounded-full flex items-center gap-1.5">
+                      <span>After: {dateStartFilter}</span>
+                      <button onClick={() => { setDateStartFilter(""); setCurrentPage(1); }} className="hover:text-red-405 text-gray-500 font-bold text-[11px] leading-none px-1">✕</button>
+                    </span>
+                  )}
+
+                  {dateEndFilter !== "" && (
+                    <span className="text-[10px] bg-blue-950/20 border border-blue-500/20 text-blue-400 pl-2.5 pr-1.5 py-1 rounded-full flex items-center gap-1.5">
+                      <span>Before: {dateEndFilter}</span>
+                      <button onClick={() => { setDateEndFilter(""); setCurrentPage(1); }} className="hover:text-red-405 text-gray-500 font-bold text-[11px] leading-none px-1">✕</button>
+                    </span>
+                  )}
+
+                  {minAgeHours !== "" && (
+                    <span className="text-[10px] bg-indigo-950/20 border border-indigo-500/20 text-indigo-400 pl-2.5 pr-1.5 py-1 rounded-full flex items-center gap-1.5">
+                      <span>Age &gt;= {minAgeHours}h</span>
+                      <button onClick={() => { setMinAgeHours(""); setCurrentPage(1); }} className="hover:text-red-405 text-gray-500 font-bold text-[11px] leading-none px-1">✕</button>
+                    </span>
+                  )}
+
+                  {maxAgeHours !== "" && (
+                    <span className="text-[10px] bg-indigo-950/20 border border-indigo-500/20 text-indigo-400 pl-2.5 pr-1.5 py-1 rounded-full flex items-center gap-1.5">
+                      <span>Age &lt;= {maxAgeHours}h</span>
+                      <button onClick={() => { setMaxAgeHours(""); setCurrentPage(1); }} className="hover:text-red-405 text-gray-500 font-bold text-[11px] leading-none px-1">✕</button>
+                    </span>
+                  )}
+
+                  <button 
+                    onClick={clearCategoryFilters}
+                    className="text-[10px] text-red-400 hover:text-red-300 underline font-sans font-bold ml-1.5"
+                  >
+                    Clear All
+                  </button>
+                </div>
+              )}
+
+              {/* 5. DATA TABLE RENDER (Simplified columns layout) */}
+              <div className="bg-[#0c0d0f] border border-[#1f2228] rounded-xl overflow-hidden shadow-sm">
+                <div className="overflow-x-auto overflow-y-auto max-h-[580px] relative scrollbar-thin scrollbar-thumb-orange-600/20">
+                  <table className="w-full text-left font-sans text-xs whitespace-nowrap table-auto select-none">
+                    
+                    {/* Simplified Table Header Column Indicators */}
+                    <thead className="sticky top-0 bg-[#0c0d0f] border-b border-[#1f2228] z-20">
+                      <tr className="text-gray-400 uppercase text-[10px] tracking-wider font-bold">
+                        <th className="px-4 py-3 border-r border-[#1f2228] text-center w-14 bg-[#0c0d0f]">No.</th>
+                        
+                        {/* Timestamp Header */}
+                        <th 
+                          onClick={() => handleSort("timestamp")}
+                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group"
+                        >
+                          <div className="flex items-center justify-between gap-1.5 text-gray-100">
+                            <span>Timestamp</span>
+                            {renderSortIndicator("timestamp")}
+                          </div>
+                        </th>
+
+                        {/* Status Header (if detected column name exists) */}
+                        {detectedStatusColName && (
                           <th 
-                            onClick={() => handleSort("age")}
-                            className="px-4 py-3.5 text-right bg-orange-900/10 text-orange-400 font-bold cursor-pointer hover:bg-orange-900/20 transition min-w-[140px] group"
-                            title="Click to sort by calculated age"
+                            onClick={() => handleSort(detectedStatusColName)}
+                            className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group"
                           >
-                            <div className="flex items-center justify-end gap-1.5">
-                              <span>Computed Age</span>
-                              {renderSortIndicator("age")}
+                            <div className="flex items-center justify-between gap-1.5">
+                              <span>Status</span>
+                              {renderSortIndicator(detectedStatusColName)}
                             </div>
                           </th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-[#2A2D35]/40">
-                        {paginatedRows.length === 0 ? (
-                          <tr>
-                            <td colSpan={headers.length + 2} className="py-24 text-center text-sm text-[#8E9299]">
-                              <Info className="w-5 h-5 mx-auto mb-2 text-[#8E9299]/70 animate-pulse" />
-                              No rows matched your search filter criteria.
-                            </td>
-                          </tr>
-                        ) : (
-                          paginatedRows.map((row, idx) => {
-                            const globalIdx = (currentPage - 1) * pageSize + idx + 1;
-                            const isExpanded = expandedRowIdx === globalIdx;
-                            return (
-                              <React.Fragment key={globalIdx}>
-                                <tr 
-                                  onClick={() => setExpandedRowIdx(isExpanded ? null : globalIdx)}
-                                  className={`border-b border-[#2A2D35]/40 hover:bg-[#1C1F26] transition text-[#D0D4DF] cursor-pointer group ${
-                                    isExpanded ? "bg-[#1C1F26]/80 border-l-2 border-l-orange-500" : "bg-[#15171C]"
-                                  }`}
-                                >
-                                  <td className="px-4 py-2 border-r border-[#2A2D35]/50 text-center font-mono text-[11px] text-[#8E9299]">
-                                    {globalIdx.toLocaleString()}
-                                  </td>
-                                  
-                                  {/* Dynamic Cells: original row elements mapped sequentially */}
-                                  {headers.map((h, hIdx) => {
-                                    const val = row.rawData[hIdx] || "";
-                                    const isTs = h === selectedTimestampCol;
-                                    return (
-                                      <td 
-                                        key={hIdx} 
-                                        className={`px-4 py-2 border-r border-[#2A2D35]/40 font-mono text-[11px] truncate max-w-[200px] ${
-                                          isTs ? "text-orange-400 font-medium" : ""
-                                        }`}
-                                      >
-                                        {val || <em className="text-gray-600 font-sans font-normal italic">empty</em>}
-                                      </td>
-                                    );
-                                  })}
+                        )}
 
-                                  {/* Appended calculated Age column */}
-                                  <td className="px-4 py-2 text-right font-mono text-[11px] font-bold text-[#FF5D22] bg-orange-950/15 group-hover:bg-orange-950/20">
-                                    {computeAgeText(row.ageMs, ageDisplayMode)}
+                        {/* Network / Platform Header (if detected column name exists) */}
+                        {detectedNetworkColName && (
+                          <th 
+                            onClick={() => handleSort(detectedNetworkColName)}
+                            className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group"
+                          >
+                            <div className="flex items-center justify-between gap-1.5">
+                              <span>Network</span>
+                              {renderSortIndicator(detectedNetworkColName)}
+                            </div>
+                          </th>
+                        )}
+
+                        {/* Message Log description Header */}
+                        <th className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] text-gray-300">
+                          Primary Activity Message / Content
+                        </th>
+
+                        {/* Computed Age Header */}
+                        <th 
+                          onClick={() => handleSort("age")}
+                          className="px-4 py-3 text-right bg-[#0c0d0f] hover:bg-[#121418] text-orange-400 font-bold cursor-pointer transition w-[140px] group select-none"
+                        >
+                          <div className="flex items-center justify-end gap-1.5 text-orange-400">
+                            <span>Computed Age</span>
+                            {renderSortIndicator("age")}
+                          </div>
+                        </th>
+
+                        {/* Expanded details button trigger column header */}
+                        <th className="px-4 py-3 text-center bg-[#0c0d0f] w-[130px] text-gray-400">
+                          Details
+                        </th>
+                      </tr>
+                    </thead>
+
+                    <tbody className="divide-y divide-[#1f2228]">
+                      {paginatedRows.length === 0 ? (
+                        <tr>
+                          <td colSpan={6 + (detectedStatusColName ? 1 : 0) + (detectedNetworkColName ? 1 : 0)} className="py-24 text-center text-sm text-gray-500">
+                            <Info className="w-5 h-5 mx-auto mb-2 text-gray-600 animate-pulse" />
+                            No rows mapped your active filters or query parameters.
+                          </td>
+                        </tr>
+                      ) : (
+                        paginatedRows.map((row, idx) => {
+                          const globalIdx = (currentPage - 1) * pageSize + idx + 1;
+                          const isExpanded = expandedRowIdx === globalIdx;
+                          
+                          // Lookups
+                          const statusColIdx = detectedStatusColName ? headers.indexOf(detectedStatusColName) : -1;
+                          const networkColIdx = detectedNetworkColName ? headers.indexOf(detectedNetworkColName) : -1;
+                          const messageColIdx = detectedMessageColName ? headers.indexOf(detectedMessageColName) : -1;
+                          
+                          const statusVal = statusColIdx !== -1 ? (row.rawData[statusColIdx] || "") : "";
+                          const networkVal = networkColIdx !== -1 ? (row.rawData[networkColIdx] || "") : "";
+                          const messageVal = messageColIdx !== -1 ? (row.rawData[messageColIdx] || "") : row.message;
+                          
+                          // Status color helpers
+                          const sLower = statusVal.toLowerCase();
+                          const isClosed = sLower.includes("close") || sLower.includes("resolve") || sLower.includes("complete") || sLower.includes("done");
+                          const isEscalated = sLower.includes("escalat") || sLower.includes("crit") || sLower.includes("high") || sLower.includes("priority");
+                          
+                          const statusBadgeColor = isClosed 
+                            ? "bg-emerald-950/20 text-emerald-400 border-emerald-500/20"
+                            : isEscalated 
+                            ? "bg-red-950/20 text-red-400 border-red-500/20"
+                            : "bg-orange-950/20 text-orange-400 border-orange-500/20";
+
+                          return (
+                            <React.Fragment key={globalIdx}>
+                              <tr 
+                                onClick={() => setExpandedRowIdx(isExpanded ? null : globalIdx)}
+                                className={`hover:bg-[#121418]/60 transition text-gray-300 font-mono text-[11px] cursor-pointer group ${
+                                  isExpanded ? "bg-[#121418] border-l-4 border-l-orange-500" : "bg-transparent"
+                                }`}
+                              >
+                                <td className="px-4 py-2.5 border-r border-[#1f2228]/50 text-center text-gray-500 select-none">
+                                  {globalIdx.toLocaleString()}
+                                </td>
+                                
+                                {/* Timestamp value */}
+                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 text-gray-205">
+                                  {row.timestamp}
+                                </td>
+
+                                {/* Status Column */}
+                                {detectedStatusColName && (
+                                  <td className="px-4 py-2.5 border-r border-[#1f2228]/40 font-sans">
+                                    {statusVal ? (
+                                      <span className={`px-2 py-0.5 border text-[10px] rounded uppercase font-bold tracking-wider ${statusBadgeColor}`}>
+                                        {statusVal}
+                                      </span>
+                                    ) : (
+                                      <span className="text-gray-600 italic">N/A</span>
+                                    )}
+                                  </td>
+                                )}
+
+                                {/* Network / Source Column */}
+                                {detectedNetworkColName && (
+                                  <td className="px-4 py-2.5 border-r border-[#1f2228]/40 font-sans">
+                                    {networkVal ? (
+                                      <span className="text-gray-100 font-semibold px-1.5 py-0.5 bg-gray-900 border border-gray-800 rounded">
+                                        {networkVal}
+                                      </span>
+                                    ) : (
+                                      <span className="text-gray-600 italic">N/A</span>
+                                    )}
+                                  </td>
+                                )}
+
+                                {/* Message activity val */}
+                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 select-text max-w-sm truncate text-gray-400 font-sans">
+                                  {messageVal || <em className="text-gray-700 italic">empty content</em>}
+                                </td>
+
+                                {/* Calculated Age */}
+                                <td className="px-4 py-2.5 text-right font-bold text-orange-400 font-mono">
+                                  {computeAgeText(row.ageMs, ageDisplayMode)}
+                                </td>
+
+                                {/* VIEW DETAILS ACCORDION BUTTON FOOTER */}
+                                <td className="px-4 py-2.5 text-center font-sans">
+                                  <span className="text-[10px] text-gray-400 border border-[#1f2228] px-2 py-1 rounded bg-[#0c0d0f] font-bold group-hover:border-orange-500 transition-colors">
+                                    {isExpanded ? "Hide ✕" : "View Details ☰"}
+                                  </span>
+                                </td>
+                              </tr>
+
+                              {/* Row detail expansion drawer drawer overlay */}
+                              {isExpanded && (
+                                <tr className="bg-gray-950 border-b border-[#1f2228]">
+                                  <td 
+                                    colSpan={6 + (detectedStatusColName ? 1 : 0) + (detectedNetworkColName ? 1 : 0)} 
+                                    className="px-6 py-5 select-text"
+                                  >
+                                    <div className="space-y-4 animate-fadeIn">
+                                      <div className="flex items-center justify-between border-b border-[#21242c] pb-2">
+                                        <div className="flex items-center gap-2 text-white font-bold text-xs uppercase tracking-wider font-sans">
+                                          <Sparkles className="w-4 h-4 text-orange-400" />
+                                          <span>Detailed Audit Explorer (Imported Record Row Analysis #{globalIdx})</span>
+                                        </div>
+                                        <span className="text-[10px] text-gray-400 font-mono">
+                                          Case Age: <strong className="text-white bg-orange-950/20 text-orange-400 border border-orange-500/20 px-1.5 py-0.5 rounded ml-1">{computeAgeText(row.ageMs, ageDisplayMode)}</strong>
+                                        </span>
+                                      </div>
+
+                                      {/* Full original conversations and structured grid mapping */}
+                                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                                        {headers.map((h, hIdx) => {
+                                          const val = row.rawData[hIdx] || "";
+                                          const isTs = h === selectedTimestampCol;
+                                          const isMsg = h === selectedMessageCol;
+                                          return (
+                                            <div key={hIdx} className="bg-[#0c0d0f] border border-[#1f2228] p-3 rounded text-xs space-y-1">
+                                              <span className="text-gray-500 font-sans font-bold text-[9px] uppercase tracking-wider block">{h}</span>
+                                              <span className={`font-mono text-gray-200 block overflow-x-auto whitespace-pre-wrap break-all ${
+                                                isTs ? "text-orange-400 font-bold" : isMsg ? "text-white select-text font-sans" : ""
+                                              }`}>
+                                                {val || <span className="text-gray-700 italic font-sans text-[11px]">empty parameter</span>}
+                                              </span>
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
                                   </td>
                                 </tr>
+                              )}
+                            </React.Fragment>
+                          );
+                        })
+                      )}
+                    </tbody>
 
-                                {/* Row detail expansion tray */}
-                                {isExpanded && (
-                                  <tr className="bg-[#0D0E11] border-b border-[#2A2D35]">
-                                    <td colSpan={headers.length + 2} className="px-6 py-4">
-                                      <div className="space-y-3.5">
-                                        <div className="flex items-center justify-between border-b border-[#2A2D35]/40 pb-2">
-                                          <div className="flex items-center gap-2 text-orange-400 font-bold text-xs uppercase tracking-wider">
-                                            <Sparkles className="w-4 h-4 text-orange-500 animate-pulse" />
-                                            <span>Expanded audit record details for row #{globalIdx}</span>
-                                          </div>
-                                          <span className="text-[10px] text-[#8E9299] font-mono">
-                                            Age result: <strong className="text-white">{computeAgeText(row.ageMs, ageDisplayMode)}</strong>
-                                          </span>
-                                        </div>
-
-                                        {/* Multi column layout containing all values */}
-                                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                                          {headers.map((h, hIdx) => {
-                                            const val = row.rawData[hIdx] || "";
-                                            const isTs = h === selectedTimestampCol;
-                                            return (
-                                              <div key={hIdx} className="bg-[#15171C] border border-[#2A2D35]/65 p-2.5 rounded-lg text-xs space-y-1">
-                                                <span className="text-[#8E9299] font-sans font-medium text-[10px] uppercase text-gray-400 block tracking-wider">{h}</span>
-                                                <span className={`font-mono text-white select-text block overflow-x-auto break-all whitespace-pre-wrap ${
-                                                  isTs ? "text-orange-400 font-bold" : ""
-                                                }`}>
-                                                  {val || <span className="text-gray-600 font-sans italic">empty</span>}
-                                                </span>
-                                              </div>
-                                            );
-                                          })}
-                                        </div>
-                                      </div>
-                                    </td>
-                                  </tr>
-                                )}
-                              </React.Fragment>
-                            );
-                          })
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
+                  </table>
                 </div>
 
                 {/* PAGINATION PANEL FOOTER */}
-                <div className="px-4 py-3 bg-[#15171C] border border-[#2A2D35] rounded-xl flex flex-col sm:flex-row items-center justify-between gap-4 text-xs select-none shadow">
-                  <span className="text-[#8E9299]">
-                    Showing <strong className="text-white">{(paginatedRows.length > 0 ? (currentPage - 1) * pageSize + 1 : 0).toLocaleString()}</strong> to <strong className="text-white">{Math.min(currentPage * pageSize, sortedAndFilteredRows.length).toLocaleString()}</strong> of <strong className="text-orange-400">{sortedAndFilteredRows.length.toLocaleString()}</strong> rows (Mapped from visual pool)
+                <div className="px-4 py-3 bg-[#0c0d0f] border-t border-[#1f2228] flex flex-col sm:flex-row items-center justify-between gap-4 text-xs select-none">
+                  <span className="text-gray-400 font-sans">
+                    Showing rows <strong className="text-white">{(paginatedRows.length > 0 ? (currentPage - 1) * pageSize + 1 : 0).toLocaleString()}</strong> to <strong className="text-white">{Math.min(currentPage * pageSize, sortedAndFilteredRows.length).toLocaleString()}</strong> of <strong className="text-orange-400 font-mono">{sortedAndFilteredRows.length.toLocaleString()}</strong> rows ({sortedAndFilteredRows.length === stats.previewRows.length ? "complete un-filtered set" : "custom active filters applied"})
                   </span>
 
-                  <div className="flex items-center gap-1.5 font-mono">
+                  <div className="flex items-center gap-1 font-mono">
                     <button
                       type="button"
                       onClick={() => { setCurrentPage(1); setExpandedRowIdx(null); }}
                       disabled={currentPage === 1}
-                      className="px-2 py-1 bg-[#1A1D23] hover:bg-[#2A2D35] disabled:opacity-45 rounded border border-[#2A2D35]/70 text-white disabled:cursor-not-allowed cursor-pointer font-bold text-[10px] uppercase"
+                      className="px-2.5 py-1 bg-gray-950 hover:bg-[#121418] disabled:opacity-30 rounded border border-[#1f2228] text-white disabled:cursor-not-allowed cursor-pointer text-[10px] uppercase font-bold"
                     >
                       First
                     </button>
@@ -1422,18 +2454,18 @@ export default function App() {
                       type="button"
                       onClick={() => { setCurrentPage(prev => Math.max(prev - 1, 1)); setExpandedRowIdx(null); }}
                       disabled={currentPage === 1}
-                      className="px-2 py-1 bg-[#1A1D23] hover:bg-[#2A2D35] disabled:opacity-45 rounded border border-[#2A2D35]/70 text-white disabled:cursor-not-allowed cursor-pointer"
+                      className="px-2.5 py-1 bg-gray-950 hover:bg-[#121418] disabled:opacity-30 rounded border border-[#1f2228] text-white disabled:cursor-not-allowed cursor-pointer text-[10px] uppercase font-bold"
                     >
                       Prev
                     </button>
-                    <span className="px-2 text-[#8E9299] text-xs">
-                      Page <strong className="text-white">{currentPage}</strong> of <strong className="text-white">{totalPages}</strong>
+                    <span className="px-2.5 text-gray-400 text-xs font-sans">
+                      Page <strong className="text-white">{currentPage}</strong> of <strong className="text-white font-mono">{totalPages}</strong>
                     </span>
                     <button
                       type="button"
                       onClick={() => { setCurrentPage(prev => Math.min(prev + 1, totalPages)); setExpandedRowIdx(null); }}
                       disabled={currentPage === totalPages}
-                      className="px-2 py-1 bg-[#1A1D23] hover:bg-[#2A2D35] disabled:opacity-45 rounded border border-[#2A2D35]/70 text-white disabled:cursor-not-allowed cursor-pointer"
+                      className="px-2.5 py-1 bg-gray-950 hover:bg-[#121418] disabled:opacity-30 rounded border border-[#1f2228] text-white disabled:cursor-not-allowed cursor-pointer text-[10px] uppercase font-bold"
                     >
                       Next
                     </button>
@@ -1441,137 +2473,12 @@ export default function App() {
                       type="button"
                       onClick={() => { setCurrentPage(totalPages); setExpandedRowIdx(null); }}
                       disabled={currentPage === totalPages}
-                      className="px-2 py-1 bg-[#1A1D23] hover:bg-[#2A2D35] disabled:opacity-45 rounded border border-[#2A2D35]/70 text-white disabled:cursor-not-allowed cursor-pointer font-bold text-[10px] uppercase"
+                      className="px-2.5 py-1 bg-gray-950 hover:bg-[#121418] disabled:opacity-30 rounded border border-[#1f2228] text-white disabled:cursor-not-allowed cursor-pointer text-[10px] uppercase font-bold"
                     >
                       Last
                     </button>
                   </div>
                 </div>
-
-              </div>
-
-              {/* RIGHT SIDE: AGE SUMMARY PANEL & STATS (Sticky position) */}
-              <div className="lg:col-span-4 space-y-6 lg:sticky lg:top-24">
-                
-                <div className="bg-[#15171C] border border-[#2A2D35] rounded-xl p-5 space-y-4 shadow-xl">
-                  <div className="flex items-center justify-between border-b border-[#2A2D35]/70 pb-2.5">
-                    <h3 className="text-xs text-orange-400 uppercase tracking-widest font-bold flex items-center gap-2">
-                      <Clock className="w-4 h-4 text-orange-500" />
-                      Chronological Age Summary
-                    </h3>
-                  </div>
-
-                  {/* AGE FORMAT STYLE SWITCHER */}
-                  <div className="flex items-center justify-between bg-[#0C0D10] border border-[#2A2D35]/40 p-2.5 rounded-lg">
-                    <span className="text-[10px] text-[#8E9299] uppercase font-bold tracking-wider">Age Format:</span>
-                    <div className="flex bg-[#121418] p-0.5 rounded border border-[#2A2D35]/80">
-                      <button
-                        type="button"
-                        onClick={() => setAgeDisplayMode("days-hours")}
-                        className={`px-2.5 py-1 text-[10px] uppercase font-bold rounded transition-colors cursor-pointer ${
-                          ageDisplayMode === "days-hours"
-                            ? "bg-orange-600 text-white font-extrabold shadow-sm"
-                            : "text-[#8E9299] hover:text-white"
-                        }`}
-                      >
-                        Days & Hours
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setAgeDisplayMode("total-hours")}
-                        className={`px-2.5 py-1 text-[10px] uppercase font-bold rounded transition-colors cursor-pointer ${
-                          ageDisplayMode === "total-hours"
-                            ? "bg-orange-600 text-white font-extrabold shadow-sm"
-                            : "text-[#8E9299] hover:text-white"
-                        }`}
-                      >
-                        Total Hours
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* High accuracy summary card items */}
-                  <div className="space-y-3.5">
-                    
-                    {/* Total valid rows */}
-                    <div className="bg-[#0C0D10] border border-[#2A2D35]/40 p-3.5 rounded-lg space-y-1">
-                      <span className="text-[10px] text-[#8E9299] uppercase font-semibold block tracking-wider">
-                        Evaluated Records Count
-                      </span>
-                      <div className="flex items-baseline gap-2">
-                        <strong className="text-xl font-mono text-white">
-                          {activeStats ? activeStats.validCount.toLocaleString() : "0"}
-                        </strong>
-                        <span className="text-[10px] text-[#8E9299]">valid rows</span>
-                      </div>
-                      {stats.corruptedCount > 0 && (
-                        <div className="text-[9px] text-red-400 font-mono pt-1">
-                          ⚠ Skipped {stats.corruptedCount.toLocaleString()} malformed/empty dates
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Oldest Age */}
-                    <div className="bg-[#0C0D10] border border-[#2A2D35]/40 p-3.5 rounded-lg space-y-1">
-                      <span className="text-[10px] text-[#8E9299] uppercase font-semibold block tracking-wider">
-                        Oldest Record Age
-                      </span>
-                      <strong className="text-sm font-mono text-orange-500 block">
-                        {activeStats && activeStats.maxAgeMs !== null
-                          ? computeAgeText(activeStats.maxAgeMs, ageDisplayMode)
-                          : "N/A"}
-                      </strong>
-                      <span className="text-[9px] text-[#8E9299] font-mono block truncate" title={activeStats?.oldestTimestamp}>
-                        Timestamp: {activeStats?.oldestTimestamp || "-"}
-                      </span>
-                    </div>
-
-                    {/* Newest Age */}
-                    <div className="bg-[#0C0D10] border border-[#2A2D35]/40 p-3.5 rounded-lg space-y-1">
-                      <span className="text-[10px] text-[#8E9299] uppercase font-semibold block tracking-wider">
-                        Newest Record Age
-                      </span>
-                      <strong className="text-sm font-mono text-emerald-400 block">
-                        {activeStats && activeStats.minAgeMs !== null
-                          ? computeAgeText(activeStats.minAgeMs, ageDisplayMode)
-                          : "N/A"}
-                      </strong>
-                      <span className="text-[9px] text-[#8E9299] font-mono block truncate" title={activeStats?.newestTimestamp}>
-                        Timestamp: {activeStats?.newestTimestamp || "-"}
-                      </span>
-                    </div>
-
-                    {/* Average Age */}
-                    <div className="bg-[#0C0D10] border border-[#2A2D35]/40 p-3.5 rounded-lg space-y-1">
-                      <span className="text-[10px] text-[#8E9299] uppercase font-semibold block tracking-wider">
-                        Average Record Age
-                      </span>
-                      <strong className="text-sm font-mono text-blue-400 block">
-                        {activeStats && activeStats.avgAgeMs !== null
-                          ? computeAgeText(activeStats.avgAgeMs, ageDisplayMode)
-                          : "N/A"}
-                      </strong>
-                      <span className="text-[9px] text-[#8E9299] block font-sans text-gray-400">
-                        Calculated dynamically across active filtered rows
-                      </span>
-                    </div>
-
-                  </div>
-                </div>
-
-                {/* Accuracy cross-check details panel */}
-                <div className="bg-orange-950/10 border border-orange-500/15 p-5 rounded-xl space-y-3 shadow-md">
-                  <h4 className="text-xs font-bold text-orange-400 flex items-center gap-1.5 uppercase tracking-wide">
-                    <Info className="w-4 h-4 text-orange-500 shrink-0" /> Accuracy Cross-Check
-                  </h4>
-                  <p className="text-[11px] text-[#C8CAD0] leading-relaxed">
-                    Ages are computed by taking the active Reference Clock (Now) subtract the raw date value inside the selected <strong className="text-orange-400 font-mono">"{selectedTimestampCol}"</strong> field.
-                  </p>
-                  <p className="text-[11px] text-[#C8CAD0] leading-relaxed">
-                    Click any table row inside the viewport to expand and inspect full original record values.
-                  </p>
-                </div>
-
               </div>
 
             </div>
