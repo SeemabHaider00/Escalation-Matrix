@@ -1,0 +1,6 @@
+{
+  "name": "Escalation Matrix for CX Dept.",
+  "description": "An enterprise-grade support escalation analytics platform with SLA clocks, status timeline reconstruction, queue bottleneck analysis, and Gemini AI operational insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
