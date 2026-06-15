@@ -1,4 +1,5 @@
-import React, { useState, useRef, useMemo } from "react";
+import React, { useState, useRef, useMemo, useEffect } from "react";
+import Papa from "papaparse";
 import * as XLSX from "xlsx";
 import { 
   Upload, 
@@ -82,24 +83,24 @@ export function computeWorkingAgeMs(start: Date, end: Date, excludeDays: number[
 }
 
 export const formatWorkingAgeHours = (hours: number): string => {
-  if (hours < 0 || isNaN(hours)) return "0 Days 0 Hours";
+  if (hours < 0 || isNaN(hours)) return "0 days 0 hours";
   const d = Math.floor(hours / 24);
   const h = Math.floor(hours % 24);
-  return `${d} Days ${h} Hours`;
+  return `${d} days ${h} hours`;
 };
 
 export const formatRemainingWorkingTime = (hours: number): string => {
-  if (hours <= 0 || isNaN(hours)) return "0 Hours Remaining";
+  if (hours <= 0 || isNaN(hours)) return "0 hours remaining";
   const days = Math.floor(hours / 24);
   const remHours = Math.ceil(hours % 24);
   
   if (days >= 1) {
     if (remHours === 0) {
-      return `${days} Day${days === 1 ? "" : "s"} Remaining`;
+      return `${days} days remaining`;
     }
-    return `${days} Day${days === 1 ? "" : "s"} ${remHours} Hour${remHours === 1 ? "" : "s"} Remaining`;
+    return `${days} days ${remHours} hours remaining`;
   }
-  return `${Math.ceil(hours)} Hours Remaining`;
+  return `${Math.ceil(hours)} hours remaining`;
 };
 
 export const targetStatusLabels = [
@@ -229,6 +230,7 @@ export default function App() {
   const [selectedTimestampCol, setSelectedTimestampCol] = useState<string>("");
   const [selectedMessageCol, setSelectedMessageCol] = useState<string>("");
   const [hasHeaders, setHasHeaders] = useState<boolean>(true);
+  const [autoStartProcessing, setAutoStartProcessing] = useState<boolean>(false);
   
   // High-performance analysis variables
   const [linesProcessed, setLinesProcessed] = useState<number>(0);
@@ -293,6 +295,20 @@ export default function App() {
     return result;
   };
 
+  const isProbablyHeader = (row: string[]): boolean => {
+    let textCount = 0;
+    const nonEmpty = row.filter(c => c && c.trim() !== "");
+    if (nonEmpty.length === 0) return false;
+    for (const cell of nonEmpty) {
+      const val = cell.trim();
+      const isNum = !isNaN(Number(val));
+      const d = new Date(val);
+      const isDate = !isNaN(d.getTime()) && val.length > 5;
+      if (!isNum && !isDate) textCount++;
+    }
+    return textCount > (nonEmpty.length / 2);
+  };
+
   // File loading router - checks constraints & reads headers safely before heavy stream processing
   const handleFileChange = async (file: File) => {
     if (!file) return;
@@ -308,54 +324,39 @@ export default function App() {
     setParseError(null);
     setStep("column_mapping");
 
-    // Extract first 100KB of metadata to preview structure and capture column headers
+    // Extract metadata to preview structure and capture column headers
     try {
       const isCSV = file.name.toLowerCase().endsWith(".csv") || file.type === "text/csv";
+      
+      let detectedHeaders: string[] = [];
+      let sampleRawRows: any[][] = [];
+      let isHeaderDetected = true;
+
       if (isCSV) {
-        const slice = file.slice(0, 100000);
-        const text: string = await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = () => reject(reader.error);
-          reader.readAsText(slice, "utf-8");
+        const parsedData = await new Promise<string[][]>((resolve, reject) => {
+          Papa.parse<string[]>(file, {
+            header: false,
+            preview: 11,
+            skipEmptyLines: "greedy",
+            complete: (results) => resolve(results.data),
+            error: (err) => reject(err),
+          });
         });
 
-        // Split text chunk by lines
-        const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-        if (lines.length === 0) {
+        if (parsedData.length === 0) {
           throw new Error("No readable text structures found. Header parse failed.");
         }
 
-        const detectedHeaders = parseCSVLine(lines[0]);
-        setHeaders(detectedHeaders);
-
-        // Feed up to 10 sample preview lines to the mapping stage
-        const sample: any[] = [];
-        for (let i = 1; i < Math.min(10, lines.length); i++) {
-          const cols = parseCSVLine(lines[i]);
-          const rowObj: Record<string, string> = {};
-          detectedHeaders.forEach((hdr, idx) => {
-            rowObj[hdr] = cols[idx] || "";
-          });
-          sample.push(rowObj);
+        const firstRow = parsedData[0] || [];
+        isHeaderDetected = isProbablyHeader(firstRow);
+        
+        if (isHeaderDetected) {
+          detectedHeaders = firstRow.map((h, i) => h?.trim() || `Column ${i + 1}`);
+          sampleRawRows = parsedData.slice(1);
+        } else {
+          detectedHeaders = firstRow.map((_, i) => `Column ${i + 1}`);
+          sampleRawRows = parsedData;
         }
-        setSampleRows(sample);
-
-        // Smart Mapping Auto-Detect Rules
-        let tsMatch = "";
-        let msgMatch = "";
-        detectedHeaders.forEach((hdr) => {
-          const l = hdr.toLowerCase().replace(/[\s_-]/g, "");
-          if ((l.includes("time") || l.includes("date") || l.includes("created") || l.includes("timestamp") || l.includes("opened") || l.includes("epoch")) && !tsMatch) {
-            tsMatch = hdr;
-          }
-          if ((l.includes("msg") || l.includes("text") || l.includes("note") || l.includes("body") || l.includes("message") || l.includes("descr") || l.includes("log")) && !msgMatch) {
-            msgMatch = hdr;
-          }
-        });
-
-        setSelectedTimestampCol(tsMatch || detectedHeaders[0] || "");
-        setSelectedMessageCol(msgMatch || "");
       } else {
         // XLSX/XLS binary Excel reader route fallback
         const slice = file.slice(0, 500000);
@@ -364,58 +365,76 @@ export default function App() {
         const firstSheet = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[firstSheet];
         
-        const jsonData: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+        const jsonData: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
         if (!jsonData || jsonData.length === 0) {
           throw new Error("excel sheet appears empty");
         }
 
-        const detectedHeaders = jsonData[0].map(String);
-        setHeaders(detectedHeaders);
+        const firstRow = jsonData[0].map(String);
+        isHeaderDetected = isProbablyHeader(firstRow);
 
-        // Feed samples
-        const sample: any[] = [];
-        for (let i = 1; i < Math.min(10, jsonData.length); i++) {
-          const rowObj: Record<string, string> = {};
-          detectedHeaders.forEach((hdr, idx) => {
-            rowObj[hdr] = String(jsonData[i][idx] || "");
-          });
-          sample.push(rowObj);
+        if (isHeaderDetected) {
+          detectedHeaders = firstRow.map((h, i) => h?.trim() || `Column ${i + 1}`);
+          sampleRawRows = jsonData.slice(1);
+        } else {
+          detectedHeaders = firstRow.map((_, i) => `Column ${i + 1}`);
+          sampleRawRows = jsonData;
         }
-        setSampleRows(sample);
-
-        let tsMatch = "";
-        let msgMatch = "";
-        detectedHeaders.forEach((hdr) => {
-          const l = hdr.toLowerCase().replace(/[\s_-]/g, "");
-          if ((l.includes("time") || l.includes("date") || l.includes("created") || l.includes("timestamp") || l.includes("opened")) && !tsMatch) {
-            tsMatch = hdr;
-          }
-          if ((l.includes("msg") || l.includes("text") || l.includes("note") || l.includes("body") || l.includes("message") || l.includes("descr")) && !msgMatch) {
-            msgMatch = hdr;
-          }
-        });
-
-        setSelectedTimestampCol(tsMatch || detectedHeaders[0] || "");
-        setSelectedMessageCol(msgMatch || "");
       }
+
+      setHasHeaders(isHeaderDetected);
+      setHeaders(detectedHeaders);
+
+      // Feed up to 10 sample preview lines to the mapping stage
+      const sample: any[] = [];
+      for (let i = 0; i < Math.min(10, sampleRawRows.length); i++) {
+        const rowObj: Record<string, string> = {};
+        detectedHeaders.forEach((hdr, idx) => {
+          rowObj[hdr] = String(sampleRawRows[i][idx] || "");
+        });
+        sample.push(rowObj);
+      }
+      setSampleRows(sample);
+
+      // Smart Mapping Auto-Detect Rules
+      let tsMatch = "";
+      let msgMatch = "";
+      
+      detectedHeaders.forEach((hdr) => {
+        const l = hdr.toLowerCase().replace(/[\s_-]/g, "");
+        
+        // Exact target check first
+        if (l === "statusstarttime") {
+          tsMatch = hdr;
+        } else if (!tsMatch && (l.includes("statusstart") || l.includes("start") || l.includes("time") || l.includes("date") || l.includes("created") || l.includes("timestamp") || l.includes("opened") || l.includes("epoch"))) {
+          tsMatch = hdr;
+        }
+        
+        if (!msgMatch && (l.includes("msg") || l.includes("text") || l.includes("note") || l.includes("body") || l.includes("message") || l.includes("descr") || l.includes("log"))) {
+          msgMatch = hdr;
+        }
+      });
+      
+      // Look explicitly for priority aging field name match again to be absolutely sure
+      const exactTimeMatch = detectedHeaders.find(h => h.toLowerCase().replace(/[\s_-]/g, "") === "statusstarttime");
+
+      setSelectedTimestampCol(exactTimeMatch || tsMatch || detectedHeaders[0] || "");
+      setSelectedMessageCol(msgMatch || "");
+
+      if (exactTimeMatch) {
+         setAutoStartProcessing(true);
+      }
+
     } catch (e: any) {
       console.warn("Fast header analysis failed. Presenting default column layouts.", e);
       // Generate default fallbacks to prevent freezing UI
-      setHeaders(["Column1", "Column2", "Column3"]);
-      setSelectedTimestampCol("Column1");
+      setHeaders(["Column 1", "Column 2", "Column 3"]);
+      setSelectedTimestampCol("Column 1");
       setSelectedMessageCol("");
     }
   };
 
-  // Asynchronous memory-safe chunk generator that parses CSV lines in blocks
   const parseCSVFileStreaming = async (file: File) => {
-    const CHUNK_SIZE = 1024 * 1024 * 2; // 2MB stream windows
-    const fileSize = file.size;
-    let offset = 0;
-    let carryOver = "";
-    let isFirstChunk = true;
-
-    // Running calculations variables (zero heavy array memory allocations)
     let totalCount = 0;
     let validCount = 0;
     let corruptedCount = 0;
@@ -429,137 +448,86 @@ export default function App() {
     let oldestTimestampStr = "";
     let newestTimestampStr = "";
 
-    // Retain a visual preview of lines in memory
     const previewPool: PreviewRow[] = [];
-    const MAX_PREVIEW_SIZE = 10000; // Limit memory preview pool
+    const MAX_PREVIEW_SIZE = 10000;
 
-    // Indices corresponding to headers
     const tsIdx = headers.indexOf(selectedTimestampCol);
     const msgIdx = selectedMessageCol ? headers.indexOf(selectedMessageCol) : -1;
 
     try {
-      while (offset < fileSize) {
-        const slice = file.slice(offset, offset + CHUNK_SIZE);
-        const text: string = await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = () => reject(reader.error);
-          reader.readAsText(slice, "utf-8");
-        });
-
-        offset += CHUNK_SIZE;
-        const combined = carryOver + text;
-        const lines = combined.split(/\r?\n/);
+      await new Promise<void>((resolve, reject) => {
+        let isFirstRow = hasHeaders;
+        let bytesParsed = 0;
         
-        // Pop the last incomplete line to append to downstream chunks
-        carryOver = lines.pop() || "";
+        Papa.parse<string[]>(file, {
+          header: false,
+          skipEmptyLines: "greedy",
+          chunkSize: 1024 * 1024 * 2, // 2MB chunks
+          step: (results, parser) => {
+            if (isFirstRow) {
+              isFirstRow = false;
+              return;
+            }
 
-        const startingLine = (isFirstChunk && hasHeaders) ? 1 : 0;
-        isFirstChunk = false;
+            const cols = results.data;
+            totalCount++;
 
-        for (let i = startingLine; i < lines.length; i++) {
-          const rawLine = lines[i].trim();
-          if (!rawLine) continue;
+            const rawTimestamp = tsIdx >= 0 ? cols[tsIdx] : "";
+            const msgValue = msgIdx >= 0 ? cols[msgIdx] : "";
 
-          totalCount++;
+            if (!rawTimestamp) {
+              corruptedCount++;
+              return;
+            }
 
-          const cols = parseCSVLine(rawLine);
-          const rawTimestamp = tsIdx >= 0 ? cols[tsIdx] : "";
-          const msgValue = msgIdx >= 0 ? cols[msgIdx] : "";
+            const timestampObj = new Date(rawTimestamp);
+            if (isNaN(timestampObj.getTime())) {
+              corruptedCount++;
+              return;
+            }
 
-          if (!rawTimestamp) {
-            corruptedCount++;
-            continue;
-          }
-
-          // Evaluate timestamp validity
-          const timestampObj = new Date(rawTimestamp);
-          if (isNaN(timestampObj.getTime())) {
-            corruptedCount++;
-            continue;
-          }
-
-          validCount++;
-          const recMs = timestampObj.getTime();
-          const ageMs = nowMs - recMs;
-
-          // Aggregation running calculus
-          if (ageMs < minAgeMs) {
-            minAgeMs = ageMs;
-            newestTimestampStr = rawTimestamp;
-          }
-          if (ageMs > maxAgeMs) {
-            maxAgeMs = ageMs;
-            oldestTimestampStr = rawTimestamp;
-          }
-          sumAgeMs += ageMs;
-
-          // Push to sample review page if under limit
-          if (previewPool.length < MAX_PREVIEW_SIZE) {
-            previewPool.push({
-              timestamp: rawTimestamp,
-              ageText: computeAgeText(ageMs),
-              ageMs: ageMs,
-              message: msgValue || "",
-              rawData: cols
-            });
-          }
-        }
-
-        // Live stream update callbacks
-        setLinesProcessed(totalCount);
-        setProgress(Math.round((Math.min(offset, fileSize) / fileSize) * 100));
-
-        // Let the web browser refresh layout cycle
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-
-      // Read remainder
-      if (carryOver.trim()) {
-        const rawLine = carryOver.trim();
-        totalCount++;
-        const cols = parseCSVLine(rawLine);
-        const rawTimestamp = tsIdx >= 0 ? cols[tsIdx] : "";
-        const msgValue = msgIdx >= 0 ? cols[msgIdx] : "";
-
-        if (rawTimestamp) {
-          const timestampObj = new Date(rawTimestamp);
-          if (!isNaN(timestampObj.getTime())) {
             validCount++;
             const recMs = timestampObj.getTime();
-            const ageMs = nowMs - recMs;
+            let ageMs = nowMs - recMs;
+            if (ageMs < 0) ageMs = 0; 
 
             if (ageMs < minAgeMs) {
               minAgeMs = ageMs;
-              newestTimestampStr = rawTimestamp;
+              newestTimestampStr = String(rawTimestamp);
             }
             if (ageMs > maxAgeMs) {
               maxAgeMs = ageMs;
-              oldestTimestampStr = rawTimestamp;
+              oldestTimestampStr = String(rawTimestamp);
             }
             sumAgeMs += ageMs;
 
             if (previewPool.length < MAX_PREVIEW_SIZE) {
               previewPool.push({
-                timestamp: rawTimestamp,
+                timestamp: String(rawTimestamp),
                 ageText: computeAgeText(ageMs),
                 ageMs: ageMs,
                 message: msgValue || "",
                 rawData: cols
               });
             }
-          } else {
-            corruptedCount++;
+          },
+          chunk: (results, parser) => {
+            // Update progress from bytes parsed
+            bytesParsed += 1024 * 1024 * 2; // rough estimate for progress bar
+            const prog = Math.round((Math.min(bytesParsed, file.size) / file.size) * 100);
+            setProgress(prog);
+            setLinesProcessed(totalCount);
+          },
+          complete: () => {
+            resolve();
+          },
+          error: (err) => {
+            reject(err);
           }
-        } else {
-          corruptedCount++;
-        }
-      }
+        });
+      });
 
       // Compute aggregates
-      const avgAgeMs = validCount > 0 ? (sumAgeMs / validCount) : 0;
-      
-      // Chronological sort ascending logic (oldest record first)
       previewPool.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
       setStats({
@@ -582,7 +550,13 @@ export default function App() {
     }
   };
 
-  // High velocity dataset ingestion processor - supports CSV streaming streams & Excel fallbacks
+  useEffect(() => {
+    if (autoStartProcessing && step === "column_mapping" && selectedTimestampCol && selectedFile) {
+      setAutoStartProcessing(false);
+      startProcessingWorkflow();
+    }
+  }, [autoStartProcessing, step, selectedTimestampCol, selectedFile]);
+
   const startProcessingWorkflow = async () => {
     if (!selectedFile) return;
 
@@ -605,7 +579,7 @@ export default function App() {
           throw new Error("worksheet appears empty");
         }
 
-        const rows: any[] = XLSX.utils.sheet_to_json(worksheet, { defval: "" });
+        const rows: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
         if (rows.length === 0) {
           throw new Error("worksheet appears empty");
         }
@@ -622,10 +596,14 @@ export default function App() {
         let newestTimestampStr = "";
 
         const previewPool: PreviewRow[] = [];
+        const tsIdx = headers.indexOf(selectedTimestampCol);
+        const msgIdx = selectedMessageCol ? headers.indexOf(selectedMessageCol) : -1;
 
-        rows.forEach((row) => {
-          const rawTimestamp = row[selectedTimestampCol] || "";
-          const msgValue = selectedMessageCol ? row[selectedMessageCol] : "";
+        const dataRows = hasHeaders ? rows.slice(1) : rows;
+
+        dataRows.forEach((rowArr) => {
+          const rawTimestamp = tsIdx >= 0 ? rowArr[tsIdx] : "";
+          const msgValue = msgIdx >= 0 ? rowArr[msgIdx] : "";
 
           if (!rawTimestamp) {
             corruptedCount++;
@@ -640,7 +618,8 @@ export default function App() {
 
           validCount++;
           const recMs = timestampObj.getTime();
-          const ageMs = nowMs - recMs;
+          let ageMs = nowMs - recMs;
+          if (ageMs < 0) ageMs = 0;
 
           if (ageMs < minAgeMs) {
             minAgeMs = ageMs;
@@ -653,8 +632,8 @@ export default function App() {
           sumAgeMs += ageMs;
 
           if (previewPool.length < 10000) {
-            const rawData = headers.map(hdr => {
-              const val = row[hdr];
+            const rawData = headers.map((hdr, i) => {
+              const val = rowArr[i];
               if (val === undefined || val === null) return "";
               if (val instanceof Date) return val.toISOString();
               return String(val);
@@ -783,7 +762,18 @@ export default function App() {
     return stats.previewRows.map(row => {
       const rawStatus = statusColIdx !== -1 ? (row.rawData[statusColIdx] || "") : "";
       const groupInfo = getStatusGroupInfo(rawStatus);
-      const start = new Date(row.timestamp);
+      
+      // Use Column S (index 18) "Status Start Time" for exact calculation per business requirements
+      const startRaw = row.rawData[18] || row.timestamp;
+      let start = new Date(startRaw);
+      if (isNaN(start.getTime())) {
+        start = new Date(row.timestamp);
+      }
+      
+      const recMs = start.getTime();
+      const refMs = refDate.getTime();
+      let ageMs = refMs - recMs;
+      if (ageMs < 0) ageMs = 0; // prevent negative ages if references are skewed
       
       const workingAgeMs = computeWorkingAgeMs(start, refDate, groupInfo.excludeDays);
       const workingAgeHours = workingAgeMs / (1000 * 60 * 60);
@@ -827,6 +817,8 @@ export default function App() {
 
       return {
         ...row,
+        ageMs,
+        ageText: computeAgeText(ageMs, "days-hours"),
         workingAgeMs,
         workingAgeHours,
         workingAgeText,
@@ -1100,62 +1092,76 @@ export default function App() {
     };
   }, [filteredRows, headers, detectedStatusColName, activeStats]);
 
-  // Aging distribution segmented by days
-  const agingDistribution = useMemo(() => {
-    let g1 = 0; // 0-1 days
-    let g2 = 0; // 1-3 days
-    let g3 = 0; // 3-7 days
-    let g4 = 0; // 7+ days
+  // 1. Chronological Backlog Distribution Grouping (0-3, 4-7, 8-15, 15+ Days)
+  const chronologicalBacklogData = useMemo(() => {
+    let band0_3 = 0;
+    let band4_7 = 0;
+    let band8_15 = 0;
+    let band15_plus = 0;
 
     const msInDay = 24 * 60 * 60 * 1000;
     filteredRows.forEach(row => {
       const d = row.ageMs / msInDay;
-      if (d <= 1) g1++;
-      else if (d <= 3) g2++;
-      else if (d <= 7) g3++;
-      else g4++;
+      if (d <= 3) band0_3++;
+      else if (d <= 7) band4_7++;
+      else if (d <= 15) band8_15++;
+      else band15_plus++;
     });
 
     const total = filteredRows.length || 1;
     return [
-      { label: "0–1 Days", count: g1, percentage: (g1 / total) * 100, color: "#10b981" },
-      { label: "1–3 Days", count: g2, percentage: (g2 / total) * 100, color: "#3b82f6" },
-      { label: "3–7 Days", count: g3, percentage: (g3 / total) * 100, color: "#f97316" },
-      { label: "7+ Days", count: g4, percentage: (g4 / total) * 100, color: "#ef4444" }
+      { name: "0–3 Days", count: band0_3, percentage: (band0_3 / total) * 100, color: "#10b981" },
+      { name: "4–7 Days", count: band4_7, percentage: (band4_7 / total) * 100, color: "#3b82f6" },
+      { name: "8–15 Days", count: band8_15, percentage: (band8_15 / total) * 100, color: "#f97316" },
+      { name: "15+ Days", count: band15_plus, percentage: (band15_plus / total) * 100, color: "#ef4444" }
     ];
   }, [filteredRows]);
 
-  // Aging metrics computed dynamically by Status name or fallbacks
-  const statusChartsData = useMemo(() => {
-    const activeCategories = Object.keys(columnCategoryFilters);
-    const groupbyCol = detectedStatusColName || activeCategories[0] || "";
-    if (!stats || !groupbyCol) return [];
+  // 2. Case Category Aging Breakdown (Status-wise Calendar Aging vs Business Aging side-by-side)
+  const statusAgingBreakdown = useMemo(() => {
+    const statusColIdx = detectedStatusColName ? headers.indexOf(detectedStatusColName) : -1;
+    if (!stats || statusColIdx === -1) return [];
 
-    const colIdx = headers.indexOf(groupbyCol);
-    if (colIdx === -1) return [];
-
-    const counts: Record<string, { count: number; sumAgeMs: number; maxAgeMs: number }> = {};
+    const statsMap: Record<string, { count: number; calendarHoursSum: number; businessHoursSum: number }> = {};
     
     filteredRows.forEach(row => {
-      const rawVal = row.rawData[colIdx] || "Unknown";
-      const statusVal = rawVal.trim() === "" ? "Empty" : rawVal;
-      if (!counts[statusVal]) {
-        counts[statusVal] = { count: 0, sumAgeMs: 0, maxAgeMs: 0 };
+      const rawValStr = String(row.rawData[statusColIdx] || "Unknown");
+      const statusLabel = rawValStr.trim() === "" ? "Other" : rawValStr.replace("Pending at ", "");
+      if (!statsMap[statusLabel]) {
+        statsMap[statusLabel] = { count: 0, calendarHoursSum: 0, businessHoursSum: 0 };
       }
-      counts[statusVal].count += 1;
-      counts[statusVal].sumAgeMs += row.ageMs;
-      if (row.ageMs > counts[statusVal].maxAgeMs) {
-        counts[statusVal].maxAgeMs = row.ageMs;
-      }
+      statsMap[statusLabel].count += 1;
+      statsMap[statusLabel].calendarHoursSum += row.ageMs / (1000 * 60 * 60);
+      statsMap[statusLabel].businessHoursSum += (row.workingAgeMs || 0) / (1000 * 60 * 60);
     });
 
-    return Object.entries(counts).map(([name, data]) => ({
-      name,
-      count: data.count,
-      avgAgeMs: data.sumAgeMs / data.count,
-      maxAgeMs: data.maxAgeMs
-    })).sort((a, b) => b.count - a.count).slice(0, 5); // top 5 categories
-  }, [filteredRows, headers, detectedStatusColName, columnCategoryFilters, stats]);
+    return Object.entries(statsMap).map(([status, data]) => ({
+      status: status.replace(" End", ""),
+      "Calendar Age": parseFloat((data.calendarHoursSum / data.count).toFixed(1)),
+      "Business Age": parseFloat((data.businessHoursSum / data.count).toFixed(1)),
+      count: data.count
+    })).sort((a, b) => b.count - a.count).slice(0, 5); // top 5 statuses
+  }, [filteredRows, headers, detectedStatusColName, stats]);
+
+  // 3. Unresolved SLA Escalations (excluding Within SLA cases, focusing only on level 1, 2, 3 alerts)
+  const unresolvedSlaData = useMemo(() => {
+    let l1 = 0;
+    let l2 = 0;
+    let l3 = 0;
+    
+    filteredRows.forEach(row => {
+      if (row.escalationLevel === "Level 1") l1++;
+      else if (row.escalationLevel === "Level 2") l2++;
+      else if (row.escalationLevel === "Level 3") l3++;
+    });
+    
+    const total = (l1 + l2 + l3) || 1;
+    return [
+      { label: "Level 1 Alert", count: l1, percentage: (l1 / total) * 100, color: "#f59e0b" },
+      { label: "Level 2 Alert", count: l2, percentage: (l2 / total) * 100, color: "#f97316" },
+      { label: "Level 3 Alert", count: l3, percentage: (l3 / total) * 100, color: "#ef4444" }
+    ];
+  }, [filteredRows]);
 
   // Escalation priority view: Top 5 unresolved cases sorting by highest ageing
   const priorityCases = useMemo(() => {
@@ -1218,34 +1224,34 @@ export default function App() {
     ];
   }, [slaCounts]);
 
-  // Handle Export Excel Sheet strictly from currently filtered rows
-  const handleExportExcel = () => {
-    if (!stats || sortedAndFilteredRows.length === 0) return;
+  // Handle Export Excel Sheet with selection of filtered vs all rows
+  const handleExportExcel = (exportType: "filtered" | "all" = "filtered") => {
+    if (!stats) return;
+    const rowsToExport = exportType === "all" ? slaProcessedRows : sortedAndFilteredRows;
+    if (rowsToExport.length === 0) return;
     
-    const dataToExport = sortedAndFilteredRows.map((row, idx) => {
-      const item: Record<string, any> = {
-        "Index": idx + 1,
-        "Timestamp": row.timestamp,
-        "Calendar Age (Days/Hours)": computeAgeText(row.ageMs, "days-hours"),
-        "Working Age (Days Hours)": row.workingAgeText || "0 Days 0 Hours",
-        "Escalation Level": row.escalationLevel || "Within SLA",
-        "SLA Threshold": row.slaThreshold || "",
-        "Remaining Time To Next Escalation": row.remainingTimeText || "",
-        "Primary Msg": row.message,
+    const dataToExport = rowsToExport.map((row, idx) => {
+      return {
+        "Case Number": row.rawData[1] || "",
+        "Origin": row.rawData[2] || "",
+        "Status": row.rawData[4] || "",
+        "Status To": row.rawData[15] || "",
+        "Status From": row.rawData[16] || "",
+        "Status Start Time": row.rawData[18] || "",
+        "Status End Time": row.rawData[19] || "",
+        "Calendar Aging": computeAgeText(row.ageMs, "days-hours"),
+        "Business Aging": row.workingAgeText || "0 days 0 hours",
+        "Escalation Level": row.escalationLevel || "Within SLA"
       };
-      // Append all other original parsed values
-      headers.forEach((h, hIdx) => {
-        item[h] = row.rawData[hIdx] || "";
-      });
-      return item;
     });
 
     const worksheet = XLSX.utils.json_to_sheet(dataToExport);
     const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Escalation Matrix Export");
+    XLSX.utils.book_append_sheet(workbook, worksheet, `SLA Export (${exportType})`);
     
     // Auto download
-    XLSX.writeFile(workbook, `Sapphire_Escalation_Export_${new Date().toISOString().split('T')[0]}.xlsx`);
+    const dateStr = new Date().toISOString().split('T')[0];
+    XLSX.writeFile(workbook, `Sapphire_Escalation_${exportType}_${dateStr}.xlsx`);
   };
 
   // Sorting handler helper
@@ -1780,10 +1786,24 @@ export default function App() {
               <div className="flex items-center gap-3">
                 <button
                   type="button"
-                  onClick={handleExportExcel}
+                  onClick={() => handleExportExcel("filtered")}
                   className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 border border-emerald-500/10 text-white text-xs font-semibold rounded-lg flex items-center gap-2 transition cursor-pointer shadow-sm font-sans"
+                  title="Export only the currently filtered dataset"
                 >
-                  <FileSpreadsheet className="w-4 h-4" /> Export Excel
+                  <FileSpreadsheet className="w-4 h-4" /> Export Filtered
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleExportExcel("all")}
+                  className={`px-4 py-2 border text-xs font-semibold rounded-lg flex items-center gap-2 transition cursor-pointer font-sans transition-colors duration-300 ${
+                    activeTheme === "dark"
+                      ? "bg-[#14231b] hover:bg-[#1a3024] border-[#1e4832] text-emerald-400"
+                      : "bg-emerald-50 hover:bg-emerald-100 border-emerald-200 text-emerald-700"
+                  }`}
+                  title="Export the entire parsed dataset"
+                >
+                  <Database className="w-4 h-4" /> Export All Data
                 </button>
 
                 <button
@@ -1814,374 +1834,188 @@ export default function App() {
                 </button>
               </div>
             </div>
-
             {/* 2. REQUIRED HORIZONTAL SUMMARY CARDS */}
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-              {/* Total Cases */}
-              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
-                activeTheme === "dark" 
-                  ? "bg-[#0c0d0f]/80 border-slate-800/80 text-white" 
-                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
-              }`}>
-                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
-                }`}>Total Active Cases</span>
-                <div className="flex items-baseline gap-1.5">
-                  <strong className={`text-2xl font-bold font-mono tracking-tight transition-colors duration-300 ${
-                    activeTheme === "dark" ? "text-white" : "text-slate-990"
-                  }`}>
-                    {dashboardMetrics.totalCount.toLocaleString()}
-                  </strong>
-                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>rows</span>
-                </div>
-              </div>
-
-              {/* Open Cases */}
-              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
-                activeTheme === "dark" 
-                  ? "bg-[#0c0d0f]/80 border-slate-800/80" 
-                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
-              }`}>
-                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
-                }`}>Open Cases</span>
-                <div className="flex items-baseline gap-1.5">
-                  <strong className="text-2xl font-bold font-mono text-orange-550 tracking-tight">
-                    {dashboardMetrics.openCount.toLocaleString()}
-                  </strong>
-                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>pending</span>
-                </div>
-              </div>
-
-              {/* Closed Cases */}
-              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
-                activeTheme === "dark" 
-                  ? "bg-[#0c0d0f]/80 border-slate-800/80" 
-                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
-              }`}>
-                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
-                }`}>Closed Cases</span>
-                <div className="flex items-baseline gap-1.5">
-                  <strong className="text-2xl font-bold font-mono text-emerald-555 tracking-tight">
-                    {dashboardMetrics.closedCount.toLocaleString()}
-                  </strong>
-                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>settled</span>
-                </div>
-              </div>
-
-              {/* Avg Aging */}
-              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
-                activeTheme === "dark" 
-                  ? "bg-[#0c0d0f]/80 border-slate-800/80" 
-                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
-              }`}>
-                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
-                }`}>Avg Aging</span>
-                <div className="flex items-baseline gap-1">
-                  <strong className={`text-base font-bold font-mono tracking-tight leading-none truncate block max-w-full ${
-                    activeTheme === "dark" ? "text-blue-400" : "text-blue-600"
-                  }`}>
-                    {computeAgeText(dashboardMetrics.avgAgingMs, ageDisplayMode)}
-                  </strong>
-                </div>
-              </div>
-
-              {/* Critical Aging Cases */}
-              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
-                activeTheme === "dark" 
-                  ? "bg-[#0c0d0f]/80 border-slate-800/80" 
-                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
-              }`}>
-                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
-                }`}>Critical Unresolved</span>
-                <div className="flex items-baseline gap-1.5">
-                  <strong className="text-2xl font-bold font-mono text-red-500 tracking-tight">
-                    {dashboardMetrics.criticalCount.toLocaleString()}
-                  </strong>
-                  <span className="text-[10px] text-red-400/90 font-sans">&gt; 3d old</span>
-                </div>
-              </div>
-
-              {/* Resolved Today */}
-              <div className={`p-4 rounded-xl space-y-1.5 transition-colors duration-300 border ${
-                activeTheme === "dark" 
-                  ? "bg-[#0c0d0f]/80 border-slate-800/80" 
-                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
-              }`}>
-                <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                  activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
-                }`}>Resolved Today</span>
-                <div className="flex items-baseline gap-1.5">
-                  <strong className="text-2xl font-bold font-mono text-indigo-500 tracking-tight">
-                    {dashboardMetrics.resolvedToday.toLocaleString()}
-                  </strong>
-                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-indigo-400/90" : "text-indigo-600/90"}`}>last 24h</span>
-                </div>
-              </div>
-            </div>
-
-            {/* Business Hours SLA Escalation priority cards */}
-            <div className="space-y-2 mt-2">
-              <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                activeTheme === "dark" ? "text-[#E2E8F0]/50" : "text-slate-500"
-              }`}>Active Business Hours SLA Escalation Matrix Deck</span>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
               
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                
-                {/* Within SLA Card */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedEscalationFilter(prev => prev === "Within SLA" ? "" : "Within SLA");
-                    setCurrentPage(1);
-                  }}
-                  className={`p-4 rounded-xl border text-left transition-all duration-350 relative cursor-pointer overflow-hidden ${
-                    selectedEscalationFilter === "Within SLA"
-                      ? "ring-2 ring-emerald-500 bg-emerald-950/15 border-emerald-500/70"
-                      : activeTheme === "dark"
-                        ? "bg-[#0c0d0f]/80 border-slate-800/80 hover:bg-slate-900/40 hover:border-slate-700 text-white"
-                        : "bg-white border-slate-200 text-slate-900 hover:bg-slate-50 shadow-sm"
-                  }`}
-                >
-                  <div className="flex justify-between items-start">
-                    <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                      activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
-                    }`}>Within SLA Cases</span>
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0 block mt-1" />
-                  </div>
-                  <div className="flex items-baseline gap-1.5 mt-2">
-                    <strong className="text-3xl font-bold font-mono text-emerald-500 tracking-tight">
-                      {slaCounts.withinSLA.toLocaleString()}
-                    </strong>
-                    <span className={`text-[10px] font-sans ${
-                      activeTheme === "dark" ? "text-slate-500" : "text-slate-400"
-                    }`}>cases</span>
-                  </div>
-                  <p className={`text-[10px] mt-1 font-sans ${
-                    selectedEscalationFilter === "Within SLA" ? "text-emerald-400 font-semibold" : "text-slate-500"
+              {/* Card 1: Total Cases */}
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedEscalationFilter("");
+                  setCurrentPage(1);
+                }}
+                className={`p-4 rounded-xl border text-left transition-all duration-300 relative cursor-pointer ${
+                  selectedEscalationFilter === ""
+                    ? "ring-2 ring-blue-500 bg-blue-950/10 border-blue-500/70 text-white"
+                    : activeTheme === "dark"
+                      ? "bg-[#0c0d0f]/80 border-slate-800/80 hover:bg-slate-900/40 hover:border-slate-700 text-white"
+                      : "bg-white border-slate-200 text-slate-100 hover:bg-slate-50 shadow-sm"
+                }`}
+              >
+                <div className="flex justify-between items-start">
+                  <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                    activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                  }`}>Total Filtered Cases</span>
+                  <span className="w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0 block mt-1" />
+                </div>
+                <div className="flex items-baseline gap-1.5 mt-2">
+                  <strong className={`text-3xl font-bold font-mono tracking-tight ${
+                    selectedEscalationFilter === "" ? "text-blue-400" : activeTheme === "dark" ? "text-white" : "text-slate-900"
                   }`}>
-                    {selectedEscalationFilter === "Within SLA" ? "● Currently filtering list" : "Click to tag & filter table"}
-                  </p>
-                </button>
-
-                {/* Level 1 Escalation Card */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedEscalationFilter(prev => prev === "Level 1" ? "" : "Level 1");
-                    setCurrentPage(1);
-                  }}
-                  className={`p-4 rounded-xl border text-left transition-all duration-350 relative cursor-pointer overflow-hidden ${
-                    selectedEscalationFilter === "Level 1"
-                      ? "ring-2 ring-amber-500 bg-amber-950/15 border-amber-500/70"
-                      : activeTheme === "dark"
-                        ? "bg-[#0c0d0f]/80 border-slate-800/80 hover:bg-slate-900/40 hover:border-slate-700 text-white"
-                        : "bg-white border-slate-200 text-slate-900 hover:bg-slate-50 shadow-sm"
-                  }`}
-                >
-                  <div className="flex justify-between items-start">
-                    <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                      activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
-                    }`}>Level 1 Alert</span>
-                    <span className="w-1.5 h-1.5 rounded-full bg-amber-550 shrink-0 block mt-1" />
-                  </div>
-                  <div className="flex items-baseline gap-1.5 mt-2">
-                    <strong className="text-3xl font-bold font-mono text-amber-500 tracking-tight">
-                      {slaCounts.level1.toLocaleString()}
-                    </strong>
-                    <span className={`text-[10px] font-sans ${
-                      activeTheme === "dark" ? "text-slate-500" : "text-slate-400"
-                    }`}>cases</span>
-                  </div>
-                  <p className={`text-[10px] mt-1 font-sans ${
-                    selectedEscalationFilter === "Level 1" ? "text-amber-400 font-semibold" : "text-slate-500"
-                  }`}>
-                    {selectedEscalationFilter === "Level 1" ? "● Currently filtering list" : "Click to tag & filter table"}
-                  </p>
-                </button>
-
-                {/* Level 2 Escalation Card */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedEscalationFilter(prev => prev === "Level 2" ? "" : "Level 2");
-                    setCurrentPage(1);
-                  }}
-                  className={`p-4 rounded-xl border text-left transition-all duration-350 relative cursor-pointer overflow-hidden ${
-                    selectedEscalationFilter === "Level 2"
-                      ? "ring-2 ring-orange-500 bg-orange-950/15 border-orange-500/70"
-                      : activeTheme === "dark"
-                        ? "bg-[#0c0d0f]/80 border-slate-800/80 hover:bg-slate-900/40 hover:border-slate-700 text-white"
-                        : "bg-white border-slate-200 text-slate-900 hover:bg-slate-50 shadow-sm"
-                  }`}
-                >
-                  <div className="flex justify-between items-start">
-                    <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                      activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
-                    }`}>Level 2 Alert</span>
-                    <span className="w-1.5 h-1.5 rounded-full bg-orange-500 shrink-0 block mt-1" />
-                  </div>
-                  <div className="flex items-baseline gap-1.5 mt-2">
-                    <strong className="text-3xl font-bold font-mono text-orange-500 tracking-tight">
-                      {slaCounts.level2.toLocaleString()}
-                    </strong>
-                    <span className={`text-[10px] font-sans ${
-                      activeTheme === "dark" ? "text-slate-500" : "text-slate-400"
-                    }`}>cases</span>
-                  </div>
-                  <p className={`text-[10px] mt-1 font-sans ${
-                    selectedEscalationFilter === "Level 2" ? "text-orange-400 font-semibold" : "text-slate-500"
-                  }`}>
-                    {selectedEscalationFilter === "Level 2" ? "● Currently filtering list" : "Click to tag & filter table"}
-                  </p>
-                </button>
-
-                {/* Level 3 Escalation Card */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedEscalationFilter(prev => prev === "Level 3" ? "" : "Level 3");
-                    setCurrentPage(1);
-                  }}
-                  className={`p-4 rounded-xl border text-left transition-all duration-355 relative cursor-pointer overflow-hidden ${
-                    selectedEscalationFilter === "Level 3"
-                      ? "ring-2 ring-red-500 bg-red-950/15 border-red-500/70"
-                      : activeTheme === "dark"
-                        ? "bg-[#0c0d0f]/80 border-slate-800/80 hover:bg-slate-900/40 hover:border-slate-700 text-white"
-                        : "bg-white border-slate-200 text-slate-900 hover:bg-slate-50 shadow-sm"
-                  }`}
-                >
-                  <div className="flex justify-between items-start">
-                    <span className={`text-[10px] uppercase font-bold block tracking-wider ${
-                      activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
-                    }`}>Level 3 Alert</span>
-                    <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0 block mt-1" />
-                  </div>
-                  <div className="flex items-baseline gap-1.5 mt-2">
-                    <strong className="text-3xl font-bold font-mono text-red-500 tracking-tight">
-                      {slaCounts.level3.toLocaleString()}
-                    </strong>
-                    <span className={`text-[10px] font-sans ${
-                      activeTheme === "dark" ? "text-slate-500" : "text-slate-400"
-                    }`}>cases</span>
-                  </div>
-                  <p className={`text-[10px] mt-1 font-sans ${
-                    selectedEscalationFilter === "Level 3" ? "text-red-405 font-bold animate-pulse" : "text-slate-500"
-                  }`}>
-                    {selectedEscalationFilter === "Level 3" ? "● Currently filtering list" : "Click to tag & filter table"}
-                  </p>
-                </button>
-
-              </div>
-            </div>
-
-            {/* 3. CHARTS GRID (Escalation Distribution Donut + Status wise Matrix Heatmap) */}
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 mt-2">
-              
-              {/* CHART 1: Escalation Distribution */}
-              <div id="chart-escalation-donut" className={`lg:col-span-4 rounded-xl p-5 space-y-4 transition-colors duration-300 border ${
-                activeTheme === "dark" 
-                  ? "bg-[#0c0d0f]/80 border-slate-800/80 text-white" 
-                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
-              }`}>
-                <div className={`pb-3 border-b transition-colors duration-300 ${
-                  activeTheme === "dark" ? "border-slate-800" : "border-slate-100"
+                    {filteredRowsWithoutEscalation.length.toLocaleString()}
+                  </strong>
+                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>cases</span>
+                </div>
+                <p className={`text-[10px] mt-1 font-sans ${
+                  selectedEscalationFilter === "" ? "text-blue-405 font-semibold" : "text-slate-500"
                 }`}>
-                  <h3 className={`text-xs uppercase tracking-wider font-bold ${
-                    activeTheme === "dark" ? "text-gray-200" : "text-slate-850"
-                  }`}>
-                    1. Escalation Level Distribution
-                  </h3>
-                </div>
+                  {selectedEscalationFilter === "" ? "● Base workload mode" : "Click to view total dataset"}
+                </p>
+              </button>
 
-                <div className="h-[210px] w-full relative flex items-center justify-center">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <PieChart>
-                      <Tooltip content={<CustomTooltipPie />} />
-                      <Pie
-                        data={escalationDonutData.map(item => ({
-                          name: item.label,
-                          value: item.count,
-                          percentage: item.percentage,
-                          color: item.color
-                        }))}
-                        innerRadius="58%"
-                        outerRadius="82%"
-                        paddingAngle={4}
-                        dataKey="value"
-                        className="cursor-pointer"
-                        animationDuration={800}
-                        onClick={(e) => {
-                          if (e && e.name) {
-                            setSelectedEscalationFilter(prev => prev === e.name ? "" : e.name);
-                            setCurrentPage(1);
-                          }
-                        }}
-                      >
-                        {escalationDonutData.map((entry, index) => (
-                          <Cell 
-                            key={`cell-${index}`} 
-                            fill={entry.color} 
-                            stroke={activeTheme === "dark" ? "#07080a" : "#fff"}
-                            strokeWidth={2.5}
-                            className="hover:opacity-95 hover:scale-102 transition-transform duration-205 origin-center text-xs"
-                          />
-                        ))}
-                      </Pie>
-                    </PieChart>
-                  </ResponsiveContainer>
-                  
-                  {/* Center Label */}
-                  <div className="absolute flex flex-col items-center justify-center pointer-events-none">
-                    <span className={`text-[9px] uppercase font-bold tracking-wider ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>Filtered Active</span>
-                    <strong className={`text-xl font-bold font-mono tracking-tight ${activeTheme === "dark" ? "text-white" : "text-slate-800"}`}>
-                      {filteredRows.length.toLocaleString()}
-                    </strong>
-                  </div>
+              {/* Card 2: Within SLA */}
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedEscalationFilter(prev => prev === "Within SLA" ? "" : "Within SLA");
+                  setCurrentPage(1);
+                }}
+                className={`p-4 rounded-xl border text-left transition-all duration-300 relative cursor-pointer ${
+                  selectedEscalationFilter === "Within SLA"
+                    ? "ring-2 ring-emerald-500 bg-emerald-950/15 border-emerald-500/70 text-white"
+                    : activeTheme === "dark"
+                      ? "bg-[#0c0d0f]/80 border-slate-800/80 hover:bg-slate-900/40 hover:border-slate-700 text-white"
+                      : "bg-white border-slate-200 text-slate-100 hover:bg-slate-50 shadow-sm"
+                }`}
+              >
+                <div className="flex justify-between items-start">
+                  <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                    activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                  }`}>Within SLA</span>
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0 block mt-1" />
                 </div>
-
-                {/* Interactive Legend Grid */}
-                <div className="grid grid-cols-2 gap-2 pt-1 font-sans">
-                  {escalationDonutData.map(seg => {
-                    const isSelected = selectedEscalationFilter === seg.label;
-                    return (
-                      <button 
-                        key={seg.label} 
-                        type="button"
-                        onClick={() => {
-                          setSelectedEscalationFilter(prev => prev === seg.label ? "" : seg.label);
-                          setCurrentPage(1);
-                        }}
-                        className={`p-1.5 rounded-lg border text-left flex items-center gap-2 transition cursor-pointer ${
-                          isSelected 
-                            ? "bg-orange-500/10 border-orange-500" 
-                            : activeTheme === "dark" 
-                              ? "bg-gray-950/45 border-slate-800 hover:border-slate-700" 
-                              : "bg-slate-50 border-slate-200 hover:border-slate-300"
-                        }`}
-                      >
-                        <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: seg.color }} />
-                        <div className="min-w-0">
-                          <span className={`text-[9.5px] uppercase font-bold tracking-wider block ${
-                            activeTheme === "dark" ? "text-gray-400" : "text-slate-500"
-                          }`}>{seg.label}</span>
-                          <span className={`font-mono text-[10.5px] font-bold block ${
-                            activeTheme === "dark" ? "text-white" : "text-slate-850"
-                          }`}>
-                            {seg.count.toLocaleString()} <span className="font-sans font-normal text-gray-500 text-[9px]">({seg.percentage.toFixed(0)}%)</span>
-                          </span>
-                        </div>
-                      </button>
-                    );
-                  })}
+                <div className="flex items-baseline gap-1.5 mt-2">
+                  <strong className="text-3xl font-bold font-mono text-emerald-500 tracking-tight">
+                    {slaCounts.withinSLA.toLocaleString()}
+                  </strong>
+                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>cases</span>
                 </div>
-              </div>
+                <p className={`text-[10px] mt-1 font-sans ${
+                  selectedEscalationFilter === "Within SLA" ? "text-emerald-400 font-semibold" : "text-slate-500"
+                }`}>
+                  {selectedEscalationFilter === "Within SLA" ? "● Currently filtering list" : "Click to tag & filter"}
+                </p>
+              </button>
 
-              {/* CHART 2: Status Wise Escalation Heatmap Matrix */}
-              <div id="chart-escalation-heatmap" className={`lg:col-span-8 rounded-xl p-5 space-y-4 transition-colors duration-300 border ${
+              {/* Card 3: Level 1 Escalation */}
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedEscalationFilter(prev => prev === "Level 1" ? "" : "Level 1");
+                  setCurrentPage(1);
+                }}
+                className={`p-4 rounded-xl border text-left transition-all duration-300 relative cursor-pointer ${
+                  selectedEscalationFilter === "Level 1"
+                    ? "ring-2 ring-amber-500 bg-amber-950/15 border-amber-500/70 text-white"
+                    : activeTheme === "dark"
+                      ? "bg-[#0c0d0f]/80 border-slate-800/80 hover:bg-slate-900/40 hover:border-slate-700 text-white"
+                      : "bg-white border-slate-200 text-slate-100 hover:bg-slate-50 shadow-sm"
+                }`}
+              >
+                <div className="flex justify-between items-start">
+                  <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                    activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                  }`}>Level 1</span>
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0 block mt-1" />
+                </div>
+                <div className="flex items-baseline gap-1.5 mt-2">
+                  <strong className="text-3xl font-bold font-mono text-amber-500 tracking-tight">
+                    {slaCounts.level1.toLocaleString()}
+                  </strong>
+                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>cases</span>
+                </div>
+                <p className={`text-[10px] mt-1 font-sans ${
+                  selectedEscalationFilter === "Level 1" ? "text-amber-400 font-semibold" : "text-slate-500"
+                }`}>
+                  {selectedEscalationFilter === "Level 1" ? "● Currently filtering list" : "Click to tag & filter"}
+                </p>
+              </button>
+
+              {/* Card 4: Level 2 Escalation */}
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedEscalationFilter(prev => prev === "Level 2" ? "" : "Level 2");
+                  setCurrentPage(1);
+                }}
+                className={`p-4 rounded-xl border text-left transition-all duration-300 relative cursor-pointer ${
+                  selectedEscalationFilter === "Level 2"
+                    ? "ring-2 ring-orange-500 bg-orange-950/15 border-orange-500/70 text-white"
+                    : activeTheme === "dark"
+                      ? "bg-[#0c0d0f]/80 border-slate-800/80 hover:bg-slate-900/40 hover:border-slate-700 text-white"
+                      : "bg-white border-slate-200 text-slate-100 hover:bg-slate-50 shadow-sm"
+                }`}
+              >
+                <div className="flex justify-between items-start">
+                  <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                    activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                  }`}>Level 2</span>
+                  <span className="w-1.5 h-1.5 rounded-full bg-orange-500 shrink-0 block mt-1" />
+                </div>
+                <div className="flex items-baseline gap-1.5 mt-2">
+                  <strong className="text-3xl font-bold font-mono text-orange-550 tracking-tight">
+                    {slaCounts.level2.toLocaleString()}
+                  </strong>
+                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>cases</span>
+                </div>
+                <p className={`text-[10px] mt-1 font-sans ${
+                  selectedEscalationFilter === "Level 2" ? "text-orange-400 font-semibold" : "text-slate-500"
+                }`}>
+                  {selectedEscalationFilter === "Level 2" ? "● Currently filtering list" : "Click to tag & filter"}
+                </p>
+              </button>
+
+              {/* Card 5: Level 3 Escalation */}
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedEscalationFilter(prev => prev === "Level 3" ? "" : "Level 3");
+                  setCurrentPage(1);
+                }}
+                className={`p-4 rounded-xl border text-left transition-all duration-300 relative cursor-pointer ${
+                  selectedEscalationFilter === "Level 3"
+                    ? "ring-2 ring-red-500 bg-red-950/15 border-red-500/70 text-white"
+                    : activeTheme === "dark"
+                      ? "bg-[#0c0d0f]/80 border-slate-800/80 hover:bg-slate-900/40 hover:border-slate-700 text-white"
+                      : "bg-white border-slate-200 text-slate-100 hover:bg-slate-50 shadow-sm"
+                }`}
+              >
+                <div className="flex justify-between items-start">
+                  <span className={`text-[10px] uppercase font-bold block tracking-wider ${
+                    activeTheme === "dark" ? "text-slate-400" : "text-slate-500"
+                  }`}>Level 3</span>
+                  <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0 block mt-1" />
+                </div>
+                <div className="flex items-baseline gap-1.5 mt-2">
+                  <strong className="text-3xl font-bold font-mono text-red-550 tracking-tight">
+                    {slaCounts.level3.toLocaleString()}
+                  </strong>
+                  <span className={`text-[10px] font-sans ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>cases</span>
+                </div>
+                <p className={`text-[10px] mt-1 font-sans ${
+                  selectedEscalationFilter === "Level 3" ? "text-red-405 font-bold animate-pulse" : "text-slate-500"
+                }`}>
+                  {selectedEscalationFilter === "Level 3" ? "● Currently filtering list" : "Click to tag & filter"}
+                </p>
+              </button>
+
+            </div>
+
+            {/* 3. CHARTS GRID (Executive Aging Dashboard: Case Category Breakdown, Backlog days, and Unresolved SLA alerts) */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 mt-4">
+              
+              {/* Card A: Case Category Aging Breakdown (Calendar vs Business) */}
+              <div id="chart-aging-comparison" className={`lg:col-span-12 rounded-xl p-5 space-y-4 border transition-colors duration-300 ${
                 activeTheme === "dark" 
                   ? "bg-[#0c0d0f]/80 border-slate-800/80 text-white" 
                   : "bg-white border-slate-200 text-slate-900 shadow-xs"
@@ -2192,118 +2026,164 @@ export default function App() {
                   <h3 className={`text-xs uppercase tracking-wider font-bold ${
                     activeTheme === "dark" ? "text-gray-200" : "text-slate-855"
                   }`}>
-                    2. Status Wise Escalation Heatmap (7x4 Matrix)
+                    1. Case Category Aging Breakdown (Calendar vs Business Aging)
                   </h3>
+                  <p className="text-[10px] text-slate-500 mt-1">
+                    Comparing average Calendar Hours (all-inclusive days/nights) vs Business Hours (working hours only) side-by-side per status category.
+                  </p>
                 </div>
-
-                <div className="space-y-2 pt-1">
-                  {/* Heatmap header column names */}
-                  <div className="grid grid-cols-12 gap-1.5 text-[9px] uppercase tracking-wider font-bold text-center text-slate-500 font-mono select-none">
-                    <div className="col-span-4 text-left pl-1">Status Category</div>
-                    <div className="col-span-2 text-emerald-500">Within SLA</div>
-                    <div className="col-span-2 text-amber-500">L1 Alert</div>
-                    <div className="col-span-2 text-orange-500">L2 Alert</div>
-                    <div className="col-span-2 text-red-500">L3 Alert</div>
+                {statusAgingBreakdown.length === 0 ? (
+                  <div className="h-[210px] flex items-center justify-center text-xs text-slate-500 select-none font-mono">
+                    No active status category data available
                   </div>
+                ) : (
+                  <div className="h-[240px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={statusAgingBreakdown} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={activeTheme === "dark" ? "#1a1d24" : "#e2e8f0"} />
+                        <XAxis 
+                          dataKey="status" 
+                          tick={{ fill: activeTheme === "dark" ? "#94a3b8" : "#475569", fontSize: 9 }}
+                          axisLine={false}
+                          tickLine={false}
+                        />
+                        <YAxis 
+                          tick={{ fill: activeTheme === "dark" ? "#94a3b8" : "#475569", fontSize: 9 }}
+                          axisLine={false}
+                          tickLine={false}
+                          unit="h"
+                        />
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: activeTheme === "dark" ? "#0f172a" : "#ffffff",
+                            borderColor: activeTheme === "dark" ? "#1e293b" : "#cbd5e1",
+                            borderRadius: "8px",
+                            fontSize: "11px",
+                            color: activeTheme === "dark" ? "#f8fafc" : "#0f172a"
+                          }}
+                        />
+                        <Legend wrapperStyle={{ fontSize: "10px", marginTop: "10px" }} />
+                        <Bar dataKey="Calendar Age" fill="#3b82f6" radius={[4, 4, 0, 0]} name="Calendar Aging (Average Hours)" />
+                        <Bar dataKey="Business Age" fill="#10b981" radius={[4, 4, 0, 0]} name="Business Aging (Average Working Hours)" />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+              </div>
 
-                  {/* Heatmap Matrix Rows */}
-                  <div id="sla-heatmap-matrix" className="space-y-1.5">
-                    {statusWiseSlaMatrix.map((row, rIdx) => {
-                      const columnsList = ["Within SLA", "Level 1", "Level 2", "Level 3"] as const;
-                      
-                      return (
-                        <div key={rIdx} className="grid grid-cols-12 gap-1.5 items-center">
-                          {/* Row title status label */}
-                          <div 
-                            className={`col-span-4 text-[10px] font-sans truncate font-medium pr-1 select-none ${
-                              activeTheme === "dark" ? "text-slate-350" : "text-slate-700"
-                            }`}
-                            title={row.status}
-                          >
-                            {row.status.replace("Pending at ", "")}
-                          </div>
+              {/* Card B: Chronological Backlog Distribution */}
+              <div id="chart-backlog-distribution" className={`lg:col-span-6 rounded-xl p-5 space-y-4 border transition-colors duration-300 ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80 text-white" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <div className={`pb-3 border-b transition-colors duration-300 ${
+                  activeTheme === "dark" ? "border-slate-800" : "border-slate-100"
+                }`}>
+                  <h3 className={`text-xs uppercase tracking-wider font-bold ${
+                    activeTheme === "dark" ? "text-gray-200" : "text-slate-855"
+                  }`}>
+                    2. Chronological Backlog Distribution
+                  </h3>
+                  <p className="text-[10px] text-slate-500 mt-1 font-sans">
+                    Aggregating active backlog case inventory into standard 0–3, 4–7, 8–15, and 15+ Days elapsed timeline bands.
+                  </p>
+                </div>
+                <div className="h-[210px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={chronologicalBacklogData} margin={{ top: 10, right: 10, left: -25, bottom: 5 }}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={activeTheme === "dark" ? "#1a1d24" : "#e2e8f0"} />
+                      <XAxis 
+                        dataKey="name" 
+                        tick={{ fill: activeTheme === "dark" ? "#94a3b8" : "#475569", fontSize: 9 }}
+                        axisLine={false}
+                        tickLine={false}
+                      />
+                      <YAxis 
+                        tick={{ fill: activeTheme === "dark" ? "#94a3b8" : "#475569", fontSize: 9 }}
+                        axisLine={false}
+                        tickLine={false}
+                      />
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: activeTheme === "dark" ? "#0f172a" : "#ffffff",
+                          borderColor: activeTheme === "dark" ? "#1e293b" : "#cbd5e1",
+                          borderRadius: "8px",
+                          fontSize: "11px",
+                          color: activeTheme === "dark" ? "#f8fafc" : "#0f172a"
+                        }}
+                      />
+                      <Bar dataKey="count" radius={[4, 4, 0, 0]} name="Cases">
+                        {chronologicalBacklogData.map((entry, index) => (
+                          <Cell key={`cell-${index}`} fill={entry.color} />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
 
-                          {/* Matrix cells */}
-                          {columnsList.map((colKey) => {
-                            const val = row[colKey];
-                            
-                            // Cell visual styling based on level and value
-                            let cellStyle = "";
-                            if (val === 0) {
-                              cellStyle = activeTheme === "dark" 
-                                ? "bg-transparent text-slate-800 border-slate-950" 
-                                : "bg-slate-50/50 text-slate-240 border-slate-100/70";
-                            } else {
-                              if (colKey === "Within SLA") {
-                                cellStyle = "bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/25";
-                              } else if (colKey === "Level 1") {
-                                cellStyle = "bg-amber-500/10 hover:bg-amber-500/20 text-amber-500 border-amber-500/25";
-                              } else if (colKey === "Level 2") {
-                                cellStyle = "bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 border-orange-500/25";
-                              } else if (colKey === "Level 3") {
-                                cellStyle = "bg-red-500/15 hover:bg-red-500/25 text-red-400 border-red-500/35 font-bold";
-                              }
-                            }
-
-                            // High-contrast neon frame for actively selected filters
-                            const isCurrentStatusFiltered = detectedStatusColName && (() => {
-                              const filterVal = selectedCategoryFilters[detectedStatusColName] || "";
-                              if (!filterVal) return false;
-                              return matchRowToStatusLabel(filterVal) === row.status;
-                            })();
-                            const isCellActivelyFiltered = isCurrentStatusFiltered && selectedEscalationFilter === colKey;
-
-                            const cellHighlighter = isCellActivelyFiltered ? "ring-2 ring-orange-500 border-orange-500 scale-102 font-extrabold" : "border";
-
-                            return (
-                              <button
-                                key={colKey}
-                                type="button"
-                                disabled={val === 0 && !isCellActivelyFiltered}
-                                onClick={() => {
-                                  // Map status cell target column filter index
-                                  const statusColIdx = detectedStatusColName ? headers.indexOf(detectedStatusColName) : -1;
-                                  if (statusColIdx === -1) return;
-                                  
-                                  const matchedRawStatus = stats?.previewRows.find(pr => matchRowToStatusLabel(pr.rawData[statusColIdx] || "") === row.status)?.rawData[statusColIdx] || row.status;
-                                  
-                                  setSelectedCategoryFilters(prev => {
-                                    const currFilteredStatus = prev[detectedStatusColName];
-                                    const isFilterActive = currFilteredStatus === matchedRawStatus && selectedEscalationFilter === colKey;
-                                    
-                                    if (isFilterActive) {
-                                      setSelectedEscalationFilter("");
-                                      return { ...prev, [detectedStatusColName]: "" };
-                                    } else {
-                                      setSelectedEscalationFilter(colKey);
-                                      return { ...prev, [detectedStatusColName]: matchedRawStatus };
-                                    }
-                                  });
-                                  setCurrentPage(1);
-                                }}
-                                className={`col-span-2 text-center text-[10px] font-mono py-1.5 rounded-md transition duration-200 select-none ${cellStyle} ${cellHighlighter} ${
-                                  val > 0 ? "cursor-pointer" : "cursor-default"
-                                }`}
-                                title={`${row.status} • ${colKey}: ${val} Cases`}
-                              >
-                                {val}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      );
-                    })}
+              {/* Card C: Unresolved Aging SLA Escalations */}
+              <div id="chart-sla-escalations" className={`lg:col-span-6 rounded-xl p-5 space-y-4 border transition-colors duration-300 ${
+                activeTheme === "dark" 
+                  ? "bg-[#0c0d0f]/80 border-slate-800/80 text-white" 
+                  : "bg-white border-slate-200 text-slate-900 shadow-xs"
+              }`}>
+                <div className={`pb-3 border-b transition-colors duration-300 ${
+                  activeTheme === "dark" ? "border-slate-800" : "border-slate-100"
+                }`}>
+                  <h3 className={`text-xs uppercase tracking-wider font-bold ${
+                    activeTheme === "dark" ? "text-gray-200" : "text-slate-855"
+                  }`}>
+                    3. Unresolved Aging SLA Escalations
+                  </h3>
+                  <p className="text-[10px] text-slate-500 mt-1 font-sans">
+                    Active pending alert counts calculated according to Business Hours Aware SLA thresholds.
+                  </p>
+                </div>
+                <div className="h-[210px] w-full relative flex items-center justify-center">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={unresolvedSlaData.map(item => ({
+                          name: item.label,
+                          value: item.count,
+                          percentage: item.percentage,
+                          color: item.color
+                        }))}
+                        innerRadius="58%"
+                        outerRadius="82%"
+                        paddingAngle={5}
+                        dataKey="value"
+                        className="cursor-pointer"
+                        animationDuration={805}
+                        onClick={(e) => {
+                          if (e && e.name) {
+                            const cleanLevel = String(e.name).replace(" Alert", "");
+                            setSelectedEscalationFilter(prev => prev === cleanLevel ? "" : cleanLevel);
+                            setCurrentPage(1);
+                          }
+                        }}
+                      >
+                        {unresolvedSlaData.map((entry, index) => (
+                          <Cell 
+                            key={`cell-${index}`} 
+                            fill={entry.color} 
+                            stroke={activeTheme === "dark" ? "#07080a" : "#fff"}
+                            strokeWidth={2}
+                          />
+                        ))}
+                      </Pie>
+                    </PieChart>
+                  </ResponsiveContainer>
+                  {/* Center Label */}
+                  <div className="absolute flex flex-col items-center justify-center pointer-events-none">
+                    <span className={`text-[8px] uppercase font-bold tracking-wider ${activeTheme === "dark" ? "text-slate-500" : "text-slate-400"}`}>Alert Cases</span>
+                    <strong className={`text-xl font-bold font-mono tracking-tight ${activeTheme === "dark" ? "text-white" : "text-slate-800"}`}>
+                      {(slaCounts.level1 + slaCounts.level2 + slaCounts.level3).toLocaleString()}
+                    </strong>
                   </div>
                 </div>
-
-                <div className="flex items-center justify-between text-[9px] text-slate-500 font-mono pt-3 border-t border-slate-500/10 mb-0">
-                  <span>* Click cell to filter status & escalation tag</span>
-                  <div className="flex items-center gap-2">
-                    <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> Active SLA</span>
-                    <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-red-500" /> Incident SLA</span>
-                  </div>
-                </div>
-
               </div>
 
             </div>
@@ -2407,7 +2287,7 @@ export default function App() {
                         <Search className="w-3.5 h-3.5 text-gray-500 absolute left-3 top-1/2 -translate-y-1/2" />
                         <input
                           type="text"
-                          placeholder="Search any keyword or columns..."
+                          placeholder="Search Case Number, Origin, Status..."
                           value={searchQuery}
                           onChange={(e) => {
                             setSearchQuery(e.target.value);
@@ -2604,89 +2484,105 @@ export default function App() {
                   <table className="w-full text-left font-sans text-xs whitespace-nowrap table-auto select-none">
                     
                     {/* SLA Priority Aware Table Header */}
-                    <thead className="sticky top-0 bg-[#0c0d0f] border-b border-[#1f2228] z-20">
+                    <thead className="sticky top-0 bg-[#0c0d0f] border-b border-[#1f2228] z-30">
                       <tr className="text-gray-400 uppercase text-[10px] tracking-wider font-bold">
-                        <th className="px-4 py-3 border-r border-[#1f2228] text-center w-14 bg-[#0c0d0f]">No.</th>
-                        
-                        {/* Timestamp Header */}
                         <th 
-                          onClick={() => handleSort("timestamp")}
-                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group"
+                          onClick={() => handleSort(headers[1] || "Case Number")}
+                          className="sticky left-0 bg-[#0c0d0f] z-20 px-4 py-3 border-r border-[#1f2228] text-left hover:bg-[#121418] transition cursor-pointer select-none group w-[130px] min-w-[130px] max-w-[130px]"
                         >
                           <div className="flex items-center justify-between gap-1.5 text-gray-100">
-                            <span>Timestamp</span>
-                            {renderSortIndicator("timestamp")}
+                            <span>Case Number</span>
+                            {renderSortIndicator(headers[1] || "Case Number")}
                           </div>
                         </th>
 
-                        {/* Status Header */}
                         <th 
-                          onClick={() => handleSort(detectedStatusColName || "status")}
-                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group"
+                          onClick={() => handleSort(headers[2] || "Origin")}
+                          className="sticky left-[130px] bg-[#0c0d0f] z-20 px-4 py-3 border-r border-[#1f2228] text-left hover:bg-[#121418] transition cursor-pointer select-none group w-[130px] min-w-[130px] max-w-[130px]"
+                        >
+                          <div className="flex items-center justify-between gap-1.5 text-gray-100">
+                            <span>Origin</span>
+                            {renderSortIndicator(headers[2] || "Origin")}
+                          </div>
+                        </th>
+
+                        <th 
+                          onClick={() => handleSort(headers[4] || "Status")}
+                          className="sticky left-[260px] bg-[#0c0d0f] z-20 px-4 py-3 border-r border-[#1f2228] text-left hover:bg-[#121418] transition cursor-pointer select-none group w-[130px] min-w-[130px] max-w-[130px] shadow-[4px_0_10px_rgba(0,0,0,0.5)]"
+                        >
+                          <div className="flex items-center justify-between gap-1.5 text-gray-100">
+                            <span>Status</span>
+                            {renderSortIndicator(headers[4] || "Status")}
+                          </div>
+                        </th>
+
+                        <th 
+                          onClick={() => handleSort(headers[15] || "Status To")}
+                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group min-w-[140px]"
                         >
                           <div className="flex items-center justify-between gap-1.5">
-                            <span>Status</span>
-                            {renderSortIndicator(detectedStatusColName || "status")}
+                            <span>Status To</span>
+                            {renderSortIndicator(headers[15] || "Status To")}
                           </div>
                         </th>
 
-                        {/* Primary message */}
-                        <th className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] text-gray-300">
-                          Primary Message
+                        <th 
+                          onClick={() => handleSort(headers[16] || "Status From")}
+                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group min-w-[140px]"
+                        >
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span>Status From</span>
+                            {renderSortIndicator(headers[16] || "Status From")}
+                          </div>
                         </th>
 
-                        {/* Working Age Header (Business SLA Engine derived) */}
+                        <th 
+                          onClick={() => handleSort(headers[18] || "Status Start Time")}
+                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group min-w-[150px]"
+                        >
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span>Status Start Time</span>
+                            {renderSortIndicator(headers[18] || "Status Start Time")}
+                          </div>
+                        </th>
+
+                        <th 
+                          onClick={() => handleSort(headers[19] || "Status End Time")}
+                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group min-w-[150px]"
+                        >
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span>Status End Time</span>
+                            {renderSortIndicator(headers[19] || "Status End Time")}
+                          </div>
+                        </th>
+
+                        <th 
+                          onClick={() => handleSort("age")}
+                          className="px-4 py-3 border-r border-[#1f2228] text-right bg-[#0c0d0f] hover:bg-[#121418] text-gray-400 cursor-pointer transition min-w-[130px] group select-none"
+                        >
+                          <div className="flex items-center justify-end gap-1.5 text-slate-400">
+                            <span>Calendar Aging</span>
+                            {renderSortIndicator("age")}
+                          </div>
+                        </th>
+
                         <th 
                           onClick={() => handleSort("workingAge")}
-                          className="px-4 py-3 border-r border-[#1f2228] text-right bg-[#0c0d0f] hover:bg-[#121418] text-amber-450 font-bold cursor-pointer transition w-[140px] group select-none"
+                          className="px-4 py-3 border-r border-[#1f2228] text-right bg-[#0c0d0f] hover:bg-[#121418] text-amber-450 font-bold cursor-pointer transition min-w-[130px] group select-none"
                         >
                           <div className="flex items-center justify-end gap-1.5 text-amber-400">
-                            <span>Working Age</span>
+                            <span>Business Aging</span>
                             {renderSortIndicator("workingAge")}
                           </div>
                         </th>
 
-                        {/* Escalation Level Header */}
                         <th 
                           onClick={() => handleSort("escalationLevel")}
-                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] font-bold cursor-pointer transition w-[130px] group select-none"
+                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] font-bold cursor-pointer transition min-w-[140px] group select-none"
                         >
                           <div className="flex items-center justify-between gap-1.5">
-                            <span>SLA Status</span>
+                            <span>Escalation Level</span>
                             {renderSortIndicator("escalationLevel")}
-                          </div>
-                        </th>
-
-                        {/* SLA Threshold Header */}
-                        <th 
-                          onClick={() => handleSort("slaThreshold")}
-                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group"
-                        >
-                          <div className="flex items-center justify-between gap-1.5">
-                            <span>SLA Threshold</span>
-                            {renderSortIndicator("slaThreshold")}
-                          </div>
-                        </th>
-
-                        {/* Remaining SLA Time Header */}
-                        <th 
-                          onClick={() => handleSort("remainingTime")}
-                          className="px-4 py-3 border-r border-[#1f2228] text-left bg-[#0c0d0f] hover:bg-[#121418] transition cursor-pointer select-none group"
-                        >
-                          <div className="flex items-center justify-between gap-1.5">
-                            <span>Remaining SLA</span>
-                            {renderSortIndicator("remainingTime")}
-                          </div>
-                        </th>
-
-                        {/* Calendar Age Header */}
-                        <th 
-                          onClick={() => handleSort("age")}
-                          className="px-4 py-3 border-r border-[#1f2228] text-right bg-[#0c0d0f] hover:bg-[#121418] text-gray-400 cursor-pointer transition w-[120px] group select-none"
-                        >
-                          <div className="flex items-center justify-end gap-1.5 text-slate-400">
-                            <span>Calendar Age</span>
-                            {renderSortIndicator("age")}
                           </div>
                         </th>
 
@@ -2700,7 +2596,7 @@ export default function App() {
                     <tbody className="divide-y divide-[#1f2228]">
                       {paginatedRows.length === 0 ? (
                         <tr>
-                          <td colSpan={10} className="py-24 text-center text-sm text-gray-500">
+                          <td colSpan={11} className="py-24 text-center text-sm text-gray-500">
                             <Info className="w-5 h-5 mx-auto mb-2 text-gray-600 animate-pulse" />
                             No rows matched your active filters or query parameters.
                           </td>
@@ -2710,12 +2606,13 @@ export default function App() {
                           const globalIdx = (currentPage - 1) * pageSize + idx + 1;
                           const isExpanded = expandedRowIdx === globalIdx;
                           
-                          // Lookups
-                          const statusColIdx = detectedStatusColName ? headers.indexOf(detectedStatusColName) : -1;
-                          const messageColIdx = detectedMessageColName ? headers.indexOf(detectedMessageColName) : -1;
-                          
-                          const statusVal = statusColIdx !== -1 ? (row.rawData[statusColIdx] || "") : "";
-                          const messageVal = messageColIdx !== -1 ? (row.rawData[messageColIdx] || "") : row.message;
+                          const caseNumber = row.rawData[1] || "N/A";
+                          const origin = row.rawData[2] || "N/A";
+                          const status = row.rawData[4] || "N/A";
+                          const statusTo = row.rawData[15] || "N/A";
+                          const statusFrom = row.rawData[16] || "N/A";
+                          const statusStartTime = row.rawData[18] || "N/A";
+                          const statusEndTime = row.rawData[19] || "N/A";
                           
                           // Custom Badge styling per escalation level
                           let escalationBadgeStyle = "";
@@ -2729,80 +2626,80 @@ export default function App() {
                             escalationBadgeStyle = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20";
                           }
 
-                          // Remaining time color helper
-                          const isExpiringSoon = row.escalationLevel !== "Level 3" && row.remainingTimeText?.toLowerCase().includes("hour") && !row.remainingTimeText?.toLowerCase().includes("day");
-                          const remainingTimeColor = isExpiringSoon 
-                            ? "text-orange-400 font-semibold" 
-                            : row.escalationLevel === "Level 3" 
-                              ? "text-red-500 font-bold" 
-                              : "text-emerald-400";
+                          // Status Color logic explicitly requested
+                          let statusColorClass = "text-gray-300";
+                          const stLc = status.toLowerCase();
+                          if (stLc.includes("open")) statusColorClass = "text-orange-400 font-bold";
+                          else if (stLc.includes("pend")) statusColorClass = "text-yellow-400 font-bold";
+                          else if (stLc.includes("clos") || stLc.includes("resolv") || stLc.includes("done")) statusColorClass = "text-emerald-400 font-bold";
+                          else if (stLc.includes("escalat")) statusColorClass = "text-red-500 font-bold";
 
                           return (
                             <React.Fragment key={globalIdx}>
                               <tr 
-                                onClick={() => setExpandedRowIdx(isExpanded ? null : globalIdx)}
-                                className={`hover:bg-[#121418]/60 transition text-gray-300 font-mono text-[11px] cursor-pointer group ${
-                                  isExpanded ? "bg-[#121418] border-l-4 border-l-orange-500" : "bg-transparent"
+                                className={`hover:bg-[#121418]/60 transition text-gray-300 font-mono text-[11px] group ${
+                                  isExpanded ? "bg-[#121418]" : "bg-transparent"
                                 }`}
                               >
-                                {/* Index */}
-                                <td className="px-4 py-2.5 border-r border-[#1f2228]/50 text-center text-gray-550 select-none">
-                                  {globalIdx.toLocaleString()}
-                                </td>
-                                
-                                {/* Timestamp value */}
-                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 text-gray-205">
-                                  {row.timestamp}
+                                {/* Case Number - Sticky */}
+                                <td className="sticky left-0 z-10 px-4 py-2.5 border-r border-[#1f2228]/40 bg-[#0c0d0f] group-hover:bg-[#121418] text-white font-bold w-[130px] min-w-[130px] max-w-[130px] truncate" title={caseNumber}>
+                                  {caseNumber}
                                 </td>
 
-                                {/* Custom target-mapped SLA categories & status badges */}
-                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 font-sans">
-                                  {statusVal ? (
-                                    <span className="px-2 py-0.5 border text-[10px] rounded uppercase font-bold tracking-wider bg-gray-900 border-gray-800 text-slate-300">
-                                      {statusVal}
-                                    </span>
-                                  ) : (
-                                    <span className="text-gray-600 italic">N/A</span>
-                                  )}
+                                {/* Origin - Sticky */}
+                                <td className="sticky left-[130px] z-10 px-4 py-2.5 border-r border-[#1f2228]/40 bg-[#0c0d0f] group-hover:bg-[#121418] text-gray-300 w-[130px] min-w-[130px] max-w-[130px] truncate" title={origin}>
+                                  {origin}
                                 </td>
 
-                                {/* Message Activity Text (truncated with tooltips) */}
-                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 select-text max-w-xs truncate text-gray-400 font-sans" title={messageVal}>
-                                  {messageVal || <em className="text-gray-700 italic">No activity message provided</em>}
+                                {/* Status - Sticky */}
+                                <td className="sticky left-[260px] z-10 px-4 py-2.5 border-r border-[#1f2228]/40 bg-[#0c0d0f] group-hover:bg-[#121418] w-[130px] min-w-[130px] max-w-[130px] truncate shadow-[4px_0_10px_rgba(0,0,0,0.2)]" title={status}>
+                                  <span className={`uppercase tracking-wider ${statusColorClass}`}>
+                                    {status}
+                                  </span>
                                 </td>
 
-                                {/* Working Age (Business hours SLA specific) */}
+                                {/* Status To */}
+                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 text-gray-300 truncate max-w-[140px]" title={statusTo}>
+                                  {statusTo}
+                                </td>
+
+                                {/* Status From */}
+                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 text-gray-300 truncate max-w-[140px]" title={statusFrom}>
+                                  {statusFrom}
+                                </td>
+
+                                {/* Status Start Time */}
+                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 text-gray-300 truncate max-w-[150px]" title={statusStartTime}>
+                                  {statusStartTime}
+                                </td>
+
+                                {/* Status End Time */}
+                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 text-gray-300 truncate max-w-[150px]" title={statusEndTime}>
+                                  {statusEndTime}
+                                </td>
+
+                                {/* Calendar Age */}
+                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 text-right text-gray-500 font-mono">
+                                  {computeAgeText(row.ageMs, "days-hours")}
+                                </td>
+
+                                {/* Business Aging */}
                                 <td className="px-4 py-2.5 border-r border-[#1f2228]/40 text-right font-bold text-amber-400 font-mono">
-                                  {row.workingAgeText || "0 Days 0 Hours"}
+                                  {row.workingAgeText || "0 days 0 hours"}
                                 </td>
 
-                                {/* SLA Escalation Level Pill Badge */}
+                                {/* Escalation Level */}
                                 <td className="px-4 py-2.5 border-r border-[#1f2228]/40 font-sans">
                                   <span className={`px-2 py-0.5 border text-[9.5px] rounded uppercase font-semibold tracking-wider ${escalationBadgeStyle}`}>
                                     {row.escalationLevel || "Within SLA"}
                                   </span>
                                 </td>
 
-                                {/* SLA Threshold limit */}
-                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 text-gray-300 font-mono">
-                                  {row.slaThreshold}
-                                </td>
-
-                                {/* Remaining SLA countdown hours */}
-                                <td className={`px-4 py-2.5 border-r border-[#1f2228]/40 font-mono ${remainingTimeColor}`}>
-                                  {row.remainingTimeText}
-                                </td>
-
-                                {/* Calendar Age (total clock age) */}
-                                <td className="px-4 py-2.5 border-r border-[#1f2228]/40 text-right text-gray-500 font-mono">
-                                  {computeAgeText(row.ageMs, ageDisplayMode)}
-                                </td>
-
                                 {/* VIEW DETAILS ACCORDION BUTTON FOOTER */}
                                 <td className="px-4 py-2.5 text-center font-sans">
-                                  <span className="text-[10px] text-gray-400 border border-[#1f2228] px-2 py-1 rounded bg-[#0c0d0f] font-bold group-hover:border-orange-500 transition-colors">
+                                  <button onClick={() => setExpandedRowIdx(isExpanded ? null : globalIdx)} className="text-[10px] text-gray-400 border border-[#1f2228] px-2 py-1 rounded bg-[#121418] hover:bg-[#1a1d24] font-bold group-hover:border-orange-500 transition-colors cursor-pointer">
                                     {isExpanded ? "Hide ✕" : "Audit ☰"}
-                                  </span>
+                                  </button>
                                 </td>
                               </tr>
 
@@ -2810,7 +2707,7 @@ export default function App() {
                               {isExpanded && (
                                 <tr className="bg-gray-950 border-b border-[#1f2228]">
                                   <td 
-                                    colSpan={10} 
+                                    colSpan={11} 
                                     className="px-6 py-5 select-text"
                                   >
                                     <div className="space-y-4 animate-fadeIn">
