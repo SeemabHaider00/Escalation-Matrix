@@ -230,7 +230,8 @@ export default function App() {
   const [selectedTimestampCol, setSelectedTimestampCol] = useState<string>("");
   const [selectedMessageCol, setSelectedMessageCol] = useState<string>("");
   const [hasHeaders, setHasHeaders] = useState<boolean>(true);
-  const [autoStartProcessing, setAutoStartProcessing] = useState<boolean>(false);
+  const [showAutoDetectConfirm, setShowAutoDetectConfirm] = useState<boolean>(false);
+  const [confirmColName, setConfirmColName] = useState<string>("");
   
   // High-performance analysis variables
   const [linesProcessed, setLinesProcessed] = useState<number>(0);
@@ -348,7 +349,7 @@ export default function App() {
         }
 
         const firstRow = parsedData[0] || [];
-        isHeaderDetected = isProbablyHeader(firstRow);
+        isHeaderDetected = true;
         
         if (isHeaderDetected) {
           detectedHeaders = firstRow.map((h, i) => h?.trim() || `Column ${i + 1}`);
@@ -371,7 +372,7 @@ export default function App() {
         }
 
         const firstRow = jsonData[0].map(String);
-        isHeaderDetected = isProbablyHeader(firstRow);
+        isHeaderDetected = true;
 
         if (isHeaderDetected) {
           detectedHeaders = firstRow.map((h, i) => h?.trim() || `Column ${i + 1}`);
@@ -422,7 +423,8 @@ export default function App() {
       setSelectedMessageCol(msgMatch || "");
 
       if (exactTimeMatch) {
-         setAutoStartProcessing(true);
+         setConfirmColName(exactTimeMatch);
+         setShowAutoDetectConfirm(true);
       }
 
     } catch (e: any) {
@@ -550,12 +552,7 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    if (autoStartProcessing && step === "column_mapping" && selectedTimestampCol && selectedFile) {
-      setAutoStartProcessing(false);
-      startProcessingWorkflow();
-    }
-  }, [autoStartProcessing, step, selectedTimestampCol, selectedFile]);
+
 
   const startProcessingWorkflow = async () => {
     if (!selectedFile) return;
@@ -1543,7 +1540,36 @@ export default function App() {
 
         {/* ==================== 2. COLUMN SELECTION WIZARD STEP ==================== */}
         {step === "column_mapping" && selectedFile && (
-          <div id="step-column-mapping-view" className="space-y-6 max-w-4xl mx-auto w-full py-4">
+          <>
+            {showAutoDetectConfirm && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+                <div className="bg-[#1A1D23] border border-[#2A2D35] rounded-xl shadow-2xl max-w-md w-full p-6 animate-fadeIn">
+                  <h3 className="text-xl font-bold text-gray-100 mb-2">Column Detected</h3>
+                  <p className="text-gray-400 mb-6 font-sans">
+                    We detected <strong className="text-orange-400">{confirmColName}</strong> in your file. Would you like to automatically calculate age based on this column?
+                  </p>
+                  <div className="flex justify-end gap-3 items-center mt-6">
+                    <button
+                      onClick={() => setShowAutoDetectConfirm(false)}
+                      className="px-4 py-2 border border-[#2A2D35] text-gray-300 font-bold rounded-lg hover:bg-[#2A2D35]/50 transition text-sm cursor-pointer"
+                    >
+                      No, select manually
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowAutoDetectConfirm(false);
+                        startProcessingWorkflow();
+                      }}
+                      className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white font-bold rounded-lg transition shadow-orange-500/20 shadow-lg text-sm cursor-pointer"
+                    >
+                      Yes, use this
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+            
+            <div id="step-column-mapping-view" className="space-y-6 max-w-4xl mx-auto w-full py-4">
             
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-[#1A1D23] px-5 py-3.5 rounded-lg border border-[#2A2D35]">
               <div className="flex items-center gap-3">
@@ -1643,6 +1669,24 @@ export default function App() {
                   </label>
                 </div>
 
+                {/* Detected columns explicit visual checklist */}
+                <div className="space-y-2 mt-4">
+                  <span className="text-[10px] text-[#8E9299] uppercase tracking-wider block font-bold">Detected Columns</span>
+                  <div className="flex flex-wrap gap-2">
+                    {headers.slice(0, 8).map((h, i) => (
+                      <div key={i} className="flex items-center gap-1.5 px-2 py-1 bg-emerald-950/20 border border-emerald-900/30 rounded text-emerald-400 text-xs font-mono font-medium">
+                        <span className="text-[10px]">✓</span>
+                        {h}
+                      </div>
+                    ))}
+                    {headers.length > 8 && (
+                      <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-900/40 border border-gray-800 rounded text-gray-500 text-xs font-mono">
+                        +{headers.length - 8} more
+                      </div>
+                    )}
+                  </div>
+                </div>
+
                 {/* Micro preview block */}
                 {sampleRows.length > 0 && (
                   <div className="space-y-2">
@@ -1707,6 +1751,7 @@ export default function App() {
             </div>
 
           </div>
+          </>
         )}
 
         {/* ==================== 3. PROCESSING LOADER ==================== */}
