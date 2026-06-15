@@ -305,138 +305,23 @@ export default function App() {
       const isNum = !isNaN(Number(val));
       const d = new Date(val);
       const isDate = !isNaN(d.getTime()) && val.length > 5;
+      
+      const lc = val.toLowerCase();
+      // Recognize standard columns immediately
+      if (lc.includes("casenumber") || lc.includes("origin") || lc.includes("status") || lc.includes("time") || lc.includes("date") || lc.includes("department")) {
+        return true;
+      }
+      
       if (!isNum && !isDate) textCount++;
     }
-    return textCount > (nonEmpty.length / 2);
+    // High permissiveness for header detection over Column 1/2
+    return textCount > 0;
   };
 
   // File loading router - checks constraints & reads headers safely before heavy stream processing
-  const handleFileChange = async (file: File) => {
-    if (!file) return;
-    
-    // Exception 8. ONLY FAIL IF FILE SIZE = 0 BYTES
-    if (file.size === 0) {
-      setParseError("File Ingestion Failure: Selected file is empty (0 bytes / contains no data)");
-      setStep("import");
-      return;
-    }
+  const [ingestionPhase, setIngestionPhase] = useState<string>("Reading Uploaded Dataset...");
 
-    setSelectedFile(file);
-    setParseError(null);
-    setStep("column_mapping");
-
-    // Extract metadata to preview structure and capture column headers
-    try {
-      const isCSV = file.name.toLowerCase().endsWith(".csv") || file.type === "text/csv";
-      
-      let detectedHeaders: string[] = [];
-      let sampleRawRows: any[][] = [];
-      let isHeaderDetected = true;
-
-      if (isCSV) {
-        const parsedData = await new Promise<string[][]>((resolve, reject) => {
-          Papa.parse<string[]>(file, {
-            header: false,
-            preview: 11,
-            skipEmptyLines: "greedy",
-            complete: (results) => resolve(results.data),
-            error: (err) => reject(err),
-          });
-        });
-
-        if (parsedData.length === 0) {
-          throw new Error("No readable text structures found. Header parse failed.");
-        }
-
-        const firstRow = parsedData[0] || [];
-        isHeaderDetected = true;
-        
-        if (isHeaderDetected) {
-          detectedHeaders = firstRow.map((h, i) => h?.trim() || `Column ${i + 1}`);
-          sampleRawRows = parsedData.slice(1);
-        } else {
-          detectedHeaders = firstRow.map((_, i) => `Column ${i + 1}`);
-          sampleRawRows = parsedData;
-        }
-      } else {
-        // XLSX/XLS binary Excel reader route fallback
-        const slice = file.slice(0, 500000);
-        const arrayBuffer = await slice.arrayBuffer();
-        const workbook = XLSX.read(new Uint8Array(arrayBuffer), { type: "array" });
-        const firstSheet = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[firstSheet];
-        
-        const jsonData: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
-        if (!jsonData || jsonData.length === 0) {
-          throw new Error("excel sheet appears empty");
-        }
-
-        const firstRow = jsonData[0].map(String);
-        isHeaderDetected = true;
-
-        if (isHeaderDetected) {
-          detectedHeaders = firstRow.map((h, i) => h?.trim() || `Column ${i + 1}`);
-          sampleRawRows = jsonData.slice(1);
-        } else {
-          detectedHeaders = firstRow.map((_, i) => `Column ${i + 1}`);
-          sampleRawRows = jsonData;
-        }
-      }
-
-      setHasHeaders(isHeaderDetected);
-      setHeaders(detectedHeaders);
-
-      // Feed up to 10 sample preview lines to the mapping stage
-      const sample: any[] = [];
-      for (let i = 0; i < Math.min(10, sampleRawRows.length); i++) {
-        const rowObj: Record<string, string> = {};
-        detectedHeaders.forEach((hdr, idx) => {
-          rowObj[hdr] = String(sampleRawRows[i][idx] || "");
-        });
-        sample.push(rowObj);
-      }
-      setSampleRows(sample);
-
-      // Smart Mapping Auto-Detect Rules
-      let tsMatch = "";
-      let msgMatch = "";
-      
-      detectedHeaders.forEach((hdr) => {
-        const l = hdr.toLowerCase().replace(/[\s_-]/g, "");
-        
-        // Exact target check first
-        if (l === "statusstarttime") {
-          tsMatch = hdr;
-        } else if (!tsMatch && (l.includes("statusstart") || l.includes("start") || l.includes("time") || l.includes("date") || l.includes("created") || l.includes("timestamp") || l.includes("opened") || l.includes("epoch"))) {
-          tsMatch = hdr;
-        }
-        
-        if (!msgMatch && (l.includes("msg") || l.includes("text") || l.includes("note") || l.includes("body") || l.includes("message") || l.includes("descr") || l.includes("log"))) {
-          msgMatch = hdr;
-        }
-      });
-      
-      // Look explicitly for priority aging field name match again to be absolutely sure
-      const exactTimeMatch = detectedHeaders.find(h => h.toLowerCase().replace(/[\s_-]/g, "") === "statusstarttime");
-
-      setSelectedTimestampCol(exactTimeMatch || tsMatch || detectedHeaders[0] || "");
-      setSelectedMessageCol(msgMatch || "");
-
-      if (exactTimeMatch) {
-         setConfirmColName(exactTimeMatch);
-         setShowAutoDetectConfirm(true);
-      }
-
-    } catch (e: any) {
-      console.warn("Fast header analysis failed. Presenting default column layouts.", e);
-      // Generate default fallbacks to prevent freezing UI
-      setHeaders(["Column 1", "Column 2", "Column 3"]);
-      setSelectedTimestampCol("Column 1");
-      setSelectedMessageCol("");
-    }
-  };
-
-  const parseCSVFileStreaming = async (file: File) => {
+  const parseCSVFileStreaming = async (file: File, fileHeaders: string[], tsCol: string, msgCol: string, hasHdr: boolean) => {
     let totalCount = 0;
     let validCount = 0;
     let corruptedCount = 0;
@@ -453,83 +338,78 @@ export default function App() {
     const previewPool: PreviewRow[] = [];
     const MAX_PREVIEW_SIZE = 10000;
 
-    const tsIdx = headers.indexOf(selectedTimestampCol);
-    const msgIdx = selectedMessageCol ? headers.indexOf(selectedMessageCol) : -1;
+    const tsIdx = fileHeaders.indexOf(tsCol);
+    const msgIdx = msgCol ? fileHeaders.indexOf(msgCol) : -1;
 
     try {
       await new Promise<void>((resolve, reject) => {
-        let isFirstRow = hasHeaders;
+        let isFirstRow = hasHdr;
         let bytesParsed = 0;
         
-        Papa.parse<string[]>(file, {
+        Papa.parse<string[][]>(file, {
           header: false,
           skipEmptyLines: "greedy",
-          chunkSize: 1024 * 1024 * 2, // 2MB chunks
-          step: (results, parser) => {
-            if (isFirstRow) {
-              isFirstRow = false;
-              return;
+          chunkSize: 1024 * 1024 * 2,
+          chunk: (results) => {
+            const rows = results.data;
+            for (let i = 0; i < rows.length; i++) {
+              if (isFirstRow) {
+                isFirstRow = false;
+                continue;
+              }
+
+              const cols = rows[i];
+              totalCount++;
+
+              const rawTimestamp = tsIdx >= 0 ? cols[tsIdx] : "";
+              const msgValue = msgIdx >= 0 ? cols[msgIdx] : "";
+
+              if (!rawTimestamp) {
+                corruptedCount++;
+                continue;
+              }
+
+              const timestampObj = new Date(rawTimestamp);
+              if (isNaN(timestampObj.getTime())) {
+                corruptedCount++;
+                continue;
+              }
+
+              validCount++;
+              const recMs = timestampObj.getTime();
+              let ageMs = nowMs - recMs;
+              if (ageMs < 0) ageMs = 0; 
+
+              if (ageMs < minAgeMs) {
+                minAgeMs = ageMs;
+                newestTimestampStr = String(rawTimestamp);
+              }
+              if (ageMs > maxAgeMs) {
+                maxAgeMs = ageMs;
+                oldestTimestampStr = String(rawTimestamp);
+              }
+              sumAgeMs += ageMs;
+
+              if (previewPool.length < MAX_PREVIEW_SIZE) {
+                previewPool.push({
+                  timestamp: String(rawTimestamp),
+                  ageText: computeAgeText(ageMs),
+                  ageMs: ageMs,
+                  message: msgValue || "",
+                  rawData: cols
+                });
+              }
             }
-
-            const cols = results.data;
-            totalCount++;
-
-            const rawTimestamp = tsIdx >= 0 ? cols[tsIdx] : "";
-            const msgValue = msgIdx >= 0 ? cols[msgIdx] : "";
-
-            if (!rawTimestamp) {
-              corruptedCount++;
-              return;
-            }
-
-            const timestampObj = new Date(rawTimestamp);
-            if (isNaN(timestampObj.getTime())) {
-              corruptedCount++;
-              return;
-            }
-
-            validCount++;
-            const recMs = timestampObj.getTime();
-            let ageMs = nowMs - recMs;
-            if (ageMs < 0) ageMs = 0; 
-
-            if (ageMs < minAgeMs) {
-              minAgeMs = ageMs;
-              newestTimestampStr = String(rawTimestamp);
-            }
-            if (ageMs > maxAgeMs) {
-              maxAgeMs = ageMs;
-              oldestTimestampStr = String(rawTimestamp);
-            }
-            sumAgeMs += ageMs;
-
-            if (previewPool.length < MAX_PREVIEW_SIZE) {
-              previewPool.push({
-                timestamp: String(rawTimestamp),
-                ageText: computeAgeText(ageMs),
-                ageMs: ageMs,
-                message: msgValue || "",
-                rawData: cols
-              });
-            }
-          },
-          chunk: (results, parser) => {
-            // Update progress from bytes parsed
-            bytesParsed += 1024 * 1024 * 2; // rough estimate for progress bar
+            bytesParsed += 1024 * 1024 * 2;
             const prog = Math.round((Math.min(bytesParsed, file.size) / file.size) * 100);
-            setProgress(prog);
+            setProgress(Math.max(50, 50 + prog / 2)); // second half of progress
             setLinesProcessed(totalCount);
           },
-          complete: () => {
-            resolve();
-          },
-          error: (err) => {
-            reject(err);
-          }
+          complete: () => resolve(),
+          error: (err) => reject(err)
         });
       });
 
-      // Compute aggregates
       previewPool.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
       setStats({
@@ -543,7 +423,9 @@ export default function App() {
         newestTimestamp: newestTimestampStr,
         previewRows: previewPool
       });
-      setStep("dashboard");
+      
+      setIngestionPhase("Dataset processed successfully.");
+      setTimeout(() => setStep("dashboard"), 600);
 
     } catch (err: any) {
       console.error(err);
@@ -552,120 +434,272 @@ export default function App() {
     }
   };
 
+  const processExcelData = async (
+    rows: any[][], 
+    fileHeaders: string[], 
+    tsCol: string, 
+    msgCol: string, 
+    hasHdr: boolean
+  ) => {
+    const baseNowDate = getActiveReferenceTime();
+    const nowMs = baseNowDate.getTime();
 
+    let validCount = 0;
+    let corruptedCount = 0;
+    let minAgeMs = Infinity;
+    let maxAgeMs = -Infinity;
+    let sumAgeMs = 0;
+    let oldestTimestampStr = "";
+    let newestTimestampStr = "";
+
+    const previewPool: PreviewRow[] = [];
+    const tsIdx = fileHeaders.indexOf(tsCol);
+    const msgIdx = msgCol ? fileHeaders.indexOf(msgCol) : -1;
+
+    const dataRows = hasHdr ? rows.slice(1) : rows;
+
+    dataRows.forEach((rowArr) => {
+      const rawTimestamp = tsIdx >= 0 ? rowArr[tsIdx] : "";
+      const msgValue = msgIdx >= 0 ? rowArr[msgIdx] : "";
+
+      if (!rawTimestamp) {
+        corruptedCount++;
+        return;
+      }
+
+      const timestampObj = new Date(rawTimestamp);
+      if (isNaN(timestampObj.getTime())) {
+        corruptedCount++;
+        return;
+      }
+
+      validCount++;
+      const recMs = timestampObj.getTime();
+      let ageMs = nowMs - recMs;
+      if (ageMs < 0) ageMs = 0;
+
+      if (ageMs < minAgeMs) {
+        minAgeMs = ageMs;
+        newestTimestampStr = String(rawTimestamp);
+      }
+      if (ageMs > maxAgeMs) {
+        maxAgeMs = ageMs;
+        oldestTimestampStr = String(rawTimestamp);
+      }
+      sumAgeMs += ageMs;
+
+      if (previewPool.length < 10000) {
+        const rawData = fileHeaders.map((hdr, i) => {
+          const val = rowArr[i];
+          if (val === undefined || val === null) return "";
+          if (val instanceof Date) return val.toISOString();
+          return String(val);
+        });
+
+        previewPool.push({
+          timestamp: String(rawTimestamp),
+          ageText: computeAgeText(ageMs),
+          ageMs: ageMs,
+          message: String(msgValue || ""),
+          rawData: rawData
+        });
+      }
+    });
+
+    previewPool.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    setStats({
+      totalCount: rows.length,
+      validCount,
+      corruptedCount,
+      minAgeMs: isFinite(minAgeMs) ? minAgeMs : 0,
+      maxAgeMs: isFinite(maxAgeMs) ? maxAgeMs : 0,
+      sumAgeMs,
+      oldestTimestamp: oldestTimestampStr,
+      newestTimestamp: newestTimestampStr,
+      previewRows: previewPool
+    });
+    
+    setIngestionPhase("Dataset processed successfully.");
+    setTimeout(() => setStep("dashboard"), 600);
+  };
+
+  const handleFileChange = async (file: File) => {
+    if (!file) return;
+    
+    if (file.size === 0) {
+      setParseError("File Ingestion Failure: Selected file is empty (0 bytes / contains no data)");
+      setStep("import");
+      return;
+    }
+
+    setSelectedFile(file);
+    setParseError(null);
+    setStep("processing");
+    setIngestionPhase("Scanning file structure...");
+    setProgress(10);
+
+    try {
+      let isCSV = file.name.toLowerCase().endsWith(".csv") || file.type === "text/csv";
+      
+      let detectedHeaders: string[] = [];
+      let sampleRawRows: any[][] = [];
+      let isHeaderDetected = true;
+      let fullExcelRows: any[][] = [];
+
+      setTimeout(() => setIngestionPhase("Detecting headers..."), 200);
+
+      const doCsvParse = async () => {
+        const parsedData = await new Promise<string[][]>((resolve, reject) => {
+          Papa.parse<string[]>(file, {
+            header: false,
+            preview: 50,
+            skipEmptyLines: "greedy",
+            complete: (results) => resolve(results.data),
+            error: (err) => reject(err),
+          });
+        });
+
+        if (parsedData.length === 0) {
+          throw new Error("No readable text structures found. Header parse failed.");
+        }
+
+        const firstRow = parsedData[0] || [];
+        isHeaderDetected = isProbablyHeader(firstRow);
+        
+        if (isHeaderDetected) {
+          detectedHeaders = firstRow.map((h, i) => h?.trim() || `Column ${i + 1}`);
+          sampleRawRows = parsedData.slice(1, 11);
+        } else {
+          detectedHeaders = firstRow.map((_, i) => `Column ${i + 1}`);
+          sampleRawRows = parsedData.slice(0, 10);
+        }
+      };
+
+      if (isCSV) {
+        await doCsvParse();
+      } else {
+        try {
+          const arrayBuffer = await file.arrayBuffer();
+          setProgress(25);
+          const workbook = XLSX.read(new Uint8Array(arrayBuffer), { type: "array", cellDates: true });
+          const firstSheet = workbook.SheetNames[0];
+          const worksheet = workbook.Sheets[firstSheet];
+          
+          const jsonData: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
+          if (!jsonData || jsonData.length === 0) {
+            throw new Error("excel sheet appears empty");
+          }
+
+          fullExcelRows = jsonData;
+          const firstRow = jsonData[0].map(String);
+          isHeaderDetected = isProbablyHeader(firstRow);
+
+          if (isHeaderDetected) {
+            detectedHeaders = firstRow.map((h, i) => h?.trim() || `Column ${i + 1}`);
+            sampleRawRows = jsonData.slice(1, 11);
+          } else {
+            detectedHeaders = firstRow.map((_, i) => `Column ${i + 1}`);
+            sampleRawRows = jsonData.slice(0, 10);
+          }
+        } catch (err: any) {
+             console.warn("Excel parsing failed, trying CSV fallback for headers...", err);
+             isCSV = true; // Mark as CSV for the background stream
+             await doCsvParse();
+        }
+      }
+      setProgress(40);
+
+      setHasHeaders(isHeaderDetected);
+      setHeaders(detectedHeaders);
+
+      const sample: any[] = [];
+      for (let i = 0; i < Math.min(10, sampleRawRows.length); i++) {
+        const rowObj: Record<string, string> = {};
+        detectedHeaders.forEach((hdr, idx) => {
+          rowObj[hdr] = String(sampleRawRows[i][idx] || "");
+        });
+        sample.push(rowObj);
+      }
+      setSampleRows(sample);
+
+      setIngestionPhase("Searching for STATUSSTARTTIME...");
+      
+      let tsMatch = "";
+      let msgMatch = "";
+      
+      detectedHeaders.forEach((hdr) => {
+        const l = hdr.toLowerCase().replace(/[\s_-]/g, "");
+        if (l === "statusstarttime") {
+          tsMatch = hdr;
+        } else if (!tsMatch && (l.includes("statusstart") || l.includes("start") || l.includes("time") || l.includes("date") || l.includes("created") || l.includes("timestamp") || l.includes("opened") || l.includes("epoch"))) {
+          tsMatch = hdr;
+        }
+        if (!msgMatch && (l.includes("msg") || l.includes("text") || l.includes("note") || l.includes("body") || l.includes("message") || l.includes("descr") || l.includes("log"))) {
+          msgMatch = hdr;
+        }
+      });
+      
+      const exactTimeMatch = detectedHeaders.find(h => h.toLowerCase().replace(/[\s_-]/g, "") === "statusstarttime");
+
+      if (exactTimeMatch) {
+         setSelectedTimestampCol(exactTimeMatch);
+         setSelectedMessageCol(msgMatch || "");
+         setIngestionPhase("STATUSSTARTTIME column detected successfully.");
+         setProgress(50);
+         
+         setTimeout(async () => {
+             setIngestionPhase("Analyzing dataset and calculating aging...");
+             if (isCSV) {
+                 await parseCSVFileStreaming(file, detectedHeaders, exactTimeMatch, msgMatch || "", isHeaderDetected);
+             } else {
+                 await processExcelData(fullExcelRows, detectedHeaders, exactTimeMatch, msgMatch || "", isHeaderDetected);
+             }
+         }, 800);
+      } else {
+         setSelectedTimestampCol(tsMatch || detectedHeaders[0] || "");
+         setSelectedMessageCol(msgMatch || "");
+         setIngestionPhase("STATUSSTARTTIME column not found.");
+         
+         setTimeout(() => {
+             setStep("column_mapping");
+         }, 1200);
+      }
+
+    } catch (e: any) {
+      console.warn("Ingestion header analysis failed:", e);
+      setParseError(e.message || "File ingestion error.");
+      setStep("import");
+    }
+  };
 
   const startProcessingWorkflow = async () => {
     if (!selectedFile) return;
 
     setStep("processing");
-    setProgress(0);
+    setProgress(50);
+    setIngestionPhase("Analyzing dataset and calculating aging...");
     setLinesProcessed(0);
 
     const isCSV = selectedFile.name.toLowerCase().endsWith(".csv") || selectedFile.type === "text/csv";
     
     if (isCSV) {
-      await parseCSVFileStreaming(selectedFile);
+      await parseCSVFileStreaming(selectedFile, headers, selectedTimestampCol, selectedMessageCol, hasHeaders);
     } else {
-      // Invalidation guard - Excel XLSX loading segment
       try {
         const data = await selectedFile.arrayBuffer();
         const workbook = XLSX.read(new Uint8Array(data), { type: "array", cellDates: true });
         const sheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[sheetName];
-        if (!worksheet) {
-          throw new Error("worksheet appears empty");
-        }
+        if (!worksheet) throw new Error("worksheet appears empty");
 
         const rows: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
-        if (rows.length === 0) {
-          throw new Error("worksheet appears empty");
-        }
+        if (rows.length === 0) throw new Error("worksheet appears empty");
 
-        const baseNowDate = getActiveReferenceTime();
-        const nowMs = baseNowDate.getTime();
-
-        let validCount = 0;
-        let corruptedCount = 0;
-        let minAgeMs = Infinity;
-        let maxAgeMs = -Infinity;
-        let sumAgeMs = 0;
-        let oldestTimestampStr = "";
-        let newestTimestampStr = "";
-
-        const previewPool: PreviewRow[] = [];
-        const tsIdx = headers.indexOf(selectedTimestampCol);
-        const msgIdx = selectedMessageCol ? headers.indexOf(selectedMessageCol) : -1;
-
-        const dataRows = hasHeaders ? rows.slice(1) : rows;
-
-        dataRows.forEach((rowArr) => {
-          const rawTimestamp = tsIdx >= 0 ? rowArr[tsIdx] : "";
-          const msgValue = msgIdx >= 0 ? rowArr[msgIdx] : "";
-
-          if (!rawTimestamp) {
-            corruptedCount++;
-            return;
-          }
-
-          const timestampObj = new Date(rawTimestamp);
-          if (isNaN(timestampObj.getTime())) {
-            corruptedCount++;
-            return;
-          }
-
-          validCount++;
-          const recMs = timestampObj.getTime();
-          let ageMs = nowMs - recMs;
-          if (ageMs < 0) ageMs = 0;
-
-          if (ageMs < minAgeMs) {
-            minAgeMs = ageMs;
-            newestTimestampStr = String(rawTimestamp);
-          }
-          if (ageMs > maxAgeMs) {
-            maxAgeMs = ageMs;
-            oldestTimestampStr = String(rawTimestamp);
-          }
-          sumAgeMs += ageMs;
-
-          if (previewPool.length < 10000) {
-            const rawData = headers.map((hdr, i) => {
-              const val = rowArr[i];
-              if (val === undefined || val === null) return "";
-              if (val instanceof Date) return val.toISOString();
-              return String(val);
-            });
-
-            previewPool.push({
-              timestamp: String(rawTimestamp),
-              ageText: computeAgeText(ageMs),
-              ageMs: ageMs,
-              message: String(msgValue || ""),
-              rawData: rawData
-            });
-          }
-        });
-
-        // Trigger sort by historical timestamp date
-        previewPool.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-        setStats({
-          totalCount: rows.length,
-          validCount,
-          corruptedCount,
-          minAgeMs: isFinite(minAgeMs) ? minAgeMs : 0,
-          maxAgeMs: isFinite(maxAgeMs) ? maxAgeMs : 0,
-          sumAgeMs,
-          oldestTimestamp: oldestTimestampStr,
-          newestTimestamp: newestTimestampStr,
-          previewRows: previewPool
-        });
-        setStep("dashboard");
-
+        await processExcelData(rows, headers, selectedTimestampCol, selectedMessageCol, hasHeaders);
       } catch (excelErr: any) {
         console.warn("Excel parsing issue, pivoting seamlessly to raw line CSV streaming reader:", excelErr);
-        // Error handling 8 & 9. Try alternative CSV stream parse route
-        await parseCSVFileStreaming(selectedFile);
+        await parseCSVFileStreaming(selectedFile, headers, selectedTimestampCol, selectedMessageCol, hasHeaders);
       }
     }
   };
@@ -1541,34 +1575,6 @@ export default function App() {
         {/* ==================== 2. COLUMN SELECTION WIZARD STEP ==================== */}
         {step === "column_mapping" && selectedFile && (
           <>
-            {showAutoDetectConfirm && (
-              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-                <div className="bg-[#1A1D23] border border-[#2A2D35] rounded-xl shadow-2xl max-w-md w-full p-6 animate-fadeIn">
-                  <h3 className="text-xl font-bold text-gray-100 mb-2">Column Detected</h3>
-                  <p className="text-gray-400 mb-6 font-sans">
-                    We detected <strong className="text-orange-400">{confirmColName}</strong> in your file. Would you like to automatically calculate age based on this column?
-                  </p>
-                  <div className="flex justify-end gap-3 items-center mt-6">
-                    <button
-                      onClick={() => setShowAutoDetectConfirm(false)}
-                      className="px-4 py-2 border border-[#2A2D35] text-gray-300 font-bold rounded-lg hover:bg-[#2A2D35]/50 transition text-sm cursor-pointer"
-                    >
-                      No, select manually
-                    </button>
-                    <button
-                      onClick={() => {
-                        setShowAutoDetectConfirm(false);
-                        startProcessingWorkflow();
-                      }}
-                      className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white font-bold rounded-lg transition shadow-orange-500/20 shadow-lg text-sm cursor-pointer"
-                    >
-                      Yes, use this
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-            
             <div id="step-column-mapping-view" className="space-y-6 max-w-4xl mx-auto w-full py-4">
             
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-[#1A1D23] px-5 py-3.5 rounded-lg border border-[#2A2D35]">
@@ -1765,16 +1771,16 @@ export default function App() {
             </div>
 
             <div className="space-y-2">
-              <h3 className="font-sans font-bold text-white text-base">
-                Streaming & Parsing Record Logs
+              <h3 className="font-sans font-bold text-white text-xl">
+                Reading Uploaded Dataset...
               </h3>
-              <p className="text-xs text-[#8E9299]">
-                Reading file slices in 2MB asynchronous windows to conserve memory usage.
+              <p className="text-sm font-mono text-orange-400">
+                {ingestionPhase}
               </p>
             </div>
 
             {/* Custom high-tech progress bars */}
-            <div className="w-full bg-[#1A1D23] border border-[#2A2D35] p-4 rounded-xl space-y-3.5">
+            <div className="w-full bg-[#1A1D23] border border-[#2A2D35] p-5 rounded-xl space-y-3.5">
               <div className="flex items-center justify-between text-xs font-mono">
                 <span className="text-[#8E9299]">Overall Parsing Ratio</span>
                 <span className="text-orange-400 font-bold">{progress}%</span>
@@ -1786,12 +1792,12 @@ export default function App() {
                 ></div>
               </div>
 
-              <div className="flex items-center justify-between text-xs pt-2.5 border-t border-[#2A2D35]/65">
+              <div className="flex items-center justify-between text-xs pt-3 border-t border-[#2A2D35]/65">
                 <div className="flex items-center gap-1.5 text-[#8E9299]">
-                  <Database className="w-3.5 h-3.5 text-orange-500" />
+                  <Database className="w-4 h-4 text-orange-500" />
                   <span>Total Parsed Rows:</span>
                 </div>
-                <strong className="font-mono text-white text-sm">
+                <strong className="font-mono text-white text-base">
                   {linesProcessed.toLocaleString()}
                 </strong>
               </div>
@@ -2082,8 +2088,8 @@ export default function App() {
                     No active status category data available
                   </div>
                 ) : (
-                  <div className="h-[240px] w-full">
-                    <ResponsiveContainer width="100%" height="100%">
+                  <div className="h-[240px] w-full min-w-0">
+                    <ResponsiveContainer width="100%" height="100%" minWidth={0}>
                       <BarChart data={statusAgingBreakdown} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
                         <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={activeTheme === "dark" ? "#1a1d24" : "#e2e8f0"} />
                         <XAxis 
@@ -2134,8 +2140,8 @@ export default function App() {
                     Aggregating active backlog case inventory into standard 0–3, 4–7, 8–15, and 15+ Days elapsed timeline bands.
                   </p>
                 </div>
-                <div className="h-[210px] w-full">
-                  <ResponsiveContainer width="100%" height="100%">
+                <div className="h-[210px] w-full min-w-0">
+                  <ResponsiveContainer width="100%" height="100%" minWidth={0}>
                     <BarChart data={chronologicalBacklogData} margin={{ top: 10, right: 10, left: -25, bottom: 5 }}>
                       <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={activeTheme === "dark" ? "#1a1d24" : "#e2e8f0"} />
                       <XAxis 
@@ -2186,8 +2192,8 @@ export default function App() {
                     Active pending alert counts calculated according to Business Hours Aware SLA thresholds.
                   </p>
                 </div>
-                <div className="h-[210px] w-full relative flex items-center justify-center">
-                  <ResponsiveContainer width="100%" height="100%">
+                <div className="h-[210px] w-full relative flex items-center justify-center min-w-0">
+                  <ResponsiveContainer width="100%" height="100%" minWidth={0}>
                     <PieChart>
                       <Pie
                         data={unresolvedSlaData.map(item => ({
